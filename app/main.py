@@ -163,8 +163,15 @@ def get_page_by_title(space: str, title: str) -> dict:
     }
 
 if __name__ == "__main__":
-    # SSE(=Server-Sent Events) 전송 방식으로 실행
-    # Dockerfile 의 CMD가 "python -m app.main" 이므로 여기로 진입
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "9000"))
-    app.run_sse(host=host, port=port)
+    import os
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "9000"))
+
+    # FastMCP 최신 버전은 run_http를 제공 (streamable-http)
+    run_http = getattr(app, "run_http", None)
+    if callable(run_http):
+        app.run_http(host=host, port=port)   # ← 여기!
+    else:
+        # 구버전 대비 안전장치(HTTP 없음) — 일단 stdio로라도 구동
+        app.run()
+
