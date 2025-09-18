@@ -167,11 +167,10 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "9000"))
 
-    # FastMCP 최신 버전은 run_http를 제공 (streamable-http)
+    # FastMCP 2.x: run_http가 있으면 그걸 사용
     run_http = getattr(app, "run_http", None)
     if callable(run_http):
-        app.run_http(host=host, port=port)   # ← 여기!
+        app.run_http(host=host, port=port)
     else:
-        # 구버전 대비 안전장치(HTTP 없음) — 일단 stdio로라도 구동
-        app.run()
-
+        # 구버전 호환: run()에 transport 인자 넘겨 HTTP로 강제
+        app.run(transport="streamable-http", host=host, port=port)
