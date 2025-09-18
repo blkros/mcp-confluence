@@ -1,152 +1,170 @@
 import os
-import re
-import json
-from typing import List, Optional, Dict, Any
+import typing as t
+import requests
+from urllib.parse import quote_plus
 
-import httpx
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-
-# FastMCP: 스트리머블 HTTP로 /mcp 엔드포인트 제공
 from fastmcp import FastMCP
 
-load_dotenv()
+# ──────────────────────────────────────────────────────────────
+# 환경변수
+# ──────────────────────────────────────────────────────────────
+BASE_URL = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
+USER = os.environ.get("CONFLUENCE_USER") or ""
+PASSWORD = os.environ.get("CONFLUENCE_PASSWORD") or ""
+VERIFY_SSL = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 
-CONF_BASE = (os.getenv("CONFLUENCE_BASE_URL") or "").rstrip("/")
-CONF_USER = os.getenv("CONFLUENCE_USER") or ""
-CONF_PASS = os.getenv("CONFLUENCE_PASSWORD") or ""
-VERIFY_SSL = (os.getenv("VERIFY_SSL", "true").lower() != "false")
+if not BASE_URL:
+    raise RuntimeError("CONFLUENCE_BASE_URL is not set")
 
-if not (CONF_BASE and CONF_USER and CONF_PASS):
-    raise SystemExit("Missing env: CONFLUENCE_BASE_URL / CONFLUENCE_USER / CONFLUENCE_PASSWORD")
+# Confluence Server(/Data Center) 표준 REST 경로
+#   - 검색:        /rest/api/search?cql=...
+#   - 콘텐츠 조회: /rest/api/content/{id}?expand=...
+SEARCH_API = f"{BASE_URL}/rest/api/search"
+CONTENT_API = f"{BASE_URL}/rest/api/content"
 
-# MCP 서버 인스턴스
-app = FastMCP("Confluence MCP", transport="streamable-http")
+# 보기 URL (Confluence Server 기본)
+def page_view_url(page_id: str) -> str:
+    # Data Center/Server 공통적으로 동작하는 기본 보기 링크
+    return f"{BASE_URL}/pages/viewpage.action?pageId={page_id}"
 
-# httpx 클라이언트 (커넥션 풀)
-_client: httpx.AsyncClient | None = None
+# 세션 (Basic Auth)
+session = requests.Session()
+session.auth = (USER, PASSWORD)
+session.verify = VERIFY_SSL
+session.headers.update({
+    "Accept": "application/json",
+})
 
-async def get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(
-            base_url=CONF_BASE,
-            auth=(CONF_USER, CONF_PASS),
-            timeout=httpx.Timeout(20.0, connect=10.0),
-            verify=VERIFY_SSL,
-        )
-    return _client
+# ──────────────────────────────────────────────────────────────
+# FastMCP 앱
+# ──────────────────────────────────────────────────────────────
+app = FastMCP("Confluence MCP")
 
-def _page_url(page_id: str) -> str:
-    # Server/DC 표준 보기 URL
-    return f"{CONF_BASE}/pages/viewpage.action?pageId={page_id}"
-
-def _html_to_text(html: str) -> str:
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "html.parser")
-    # 코드/표 등은 텍스트로 풀어줌
-    text = soup.get_text(separator="\n", strip=True)
-    # 공백 정리
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+def _cql(query: str, space: t.Optional[str]) -> str:
+    # CQL 예: type=page AND text ~ "foo" AND space=ENG
+    parts = [ 'type=page', f'text ~ "{query}"' ]
+    if space:
+        parts.append(f"space={space}")
+    return " AND ".join(parts)
 
 @app.tool()
-async def confluence_search(
-    query: str,
-    space: Optional[str] = None,
-    limit: int = 10
-) -> List[Dict[str, Any]]:
+def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
     """
-    Confluence CQL 검색.
-    - query: CQL 또는 키워드 (키워드만 주면 title~ 혹은 text~로 매핑 시도)
-    - space: 특정 스페이스 키 (예: 'ENG')
-    - limit: 반환 개수
+    Confluence CQL로 페이지 검색.
+    - query: 검색어 (CQL text~)
+    - space: (선택) 스페이스 키
+    - limit: 최대 결과 수
+    반환: [{id, title, url, excerpt}] 리스트
     """
-    client = await get_client()
+    if not query or not query.strip():
+        return []
 
-    # 키워드만 들어온 경우 간단한 CQL로 보정
-    # (필요하면 여기서 title ~ "foo" OR text ~ "foo" 등으로 조합)
-    cql = query
-    if " " not in query and ":" not in query:
-        cql = f'text ~ "{query}"'
-
-    if space:
-        cql = f'space = "{space}" AND ({cql})'
-
-    params = {"cql": cql, "limit": str(limit)}
-    r = await client.get("/rest/api/search", params=params)
+    cql = _cql(query.strip(), space)
+    params = {
+        "cql": cql,
+        "limit": max(1, min(int(limit), 50)),
+        "expand": "space"  # 결과 parent 정보 등 확장
+    }
+    r = session.get(SEARCH_API, params=params, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
     r.raise_for_status()
-    data = r.json()
 
-    out: List[Dict[str, Any]] = []
-    for it in data.get("results", []):
-        content = it.get("content") or {}
-        cid = str(content.get("id") or it.get("id") or "")
+    data = r.json() or {}
+    results = data.get("results") or []
+
+    out: t.List[dict] = []
+    for it in results:
+        content = (it or {}).get("content") or {}
+        page_id = str(content.get("id") or "")
         title = content.get("title") or it.get("title") or ""
-        excerpt = it.get("excerpt") or ""
-        out.append({
-            "id": cid,
-            "title": title,
-            "url": _page_url(cid) if cid else None,
-            "excerpt": excerpt
-        })
+        excerpt = (it.get("excerpt") or "").strip()
+        if page_id and title:
+            out.append({
+                "id": page_id,
+                "title": title,
+                "url": page_view_url(page_id),
+                "excerpt": excerpt,
+            })
     return out
 
 @app.tool()
-async def confluence_get_page(
-    page_id: str,
-    html: bool = False
-) -> Dict[str, Any]:
+def get_page(page_id: str) -> dict:
     """
-    페이지 ID로 본문 가져오기.
-    - page_id: Confluence content ID
-    - html: True면 storage HTML 포함
+    페이지 ID로 본문(HTML)과 메타데이터를 조회.
+    반환: {id, title, space, version, body_html, url}
     """
-    client = await get_client()
-    r = await client.get(
-        f"/rest/api/content/{page_id}",
-        params={"expand": "body.storage,version,space"}
-    )
+    if not page_id:
+        raise ValueError("page_id is required")
+
+    url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
+    params = {"expand": "body.storage,version,space"}
+    r = session.get(url, params=params, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
+    if r.status_code == 404:
+        raise RuntimeError(f"Page not found: {page_id}")
     r.raise_for_status()
-    d = r.json()
-    body_html = (d.get("body", {}).get("storage", {}).get("value") or "")
-    payload = {
-        "id": str(d.get("id")),
-        "title": d.get("title"),
-        "url": _page_url(str(d.get("id"))),
-        "space": (d.get("space") or {}).get("key"),
-        "version": (d.get("version") or {}).get("number"),
-        "body_text": _html_to_text(body_html),
+
+    j = r.json() or {}
+    body_html = ""
+    body = (j.get("body") or {}).get("storage") or {}
+    if body.get("value"):
+        body_html = body["value"]
+
+    return {
+        "id": str(j.get("id") or page_id),
+        "title": j.get("title") or "",
+        "space": ((j.get("space") or {}).get("key")) or "",
+        "version": ((j.get("version") or {}).get("number")) or 0,
+        "body_html": body_html,
+        "url": page_view_url(str(j.get("id") or page_id)),
     }
-    if html:
-        payload["body_html"] = body_html
-    return payload
 
 @app.tool()
-async def confluence_get_by_url(
-    url: str,
-    html: bool = False
-) -> Dict[str, Any]:
+def get_page_by_title(space: str, title: str) -> dict:
     """
-    보기 URL(viewpage.action?pageId=...)에서 pageId를 추출해 get_page 수행.
+    스페이스 + 제목으로 단일 페이지 조회(가장 정확히 일치하는 것 1건).
+    반환: {id, title, space, version, body_html, url}
     """
-    m = re.search(r"[?&]pageId=(\d+)", url)
-    if not m:
-        raise ValueError("URL에서 pageId를 찾을 수 없습니다.")
-    return await confluence_get_page(m.group(1), html=html)
+    if not space or not title:
+        raise ValueError("space and title are required")
 
-@app.healthz()
-async def healthz() -> Dict[str, Any]:
-    client = await get_client()
-    try:
-        r = await client.get("/rest/api/space?limit=1")
-        ok = r.status_code < 500
-        return {"ok": ok}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    params = {
+        "title": title,
+        "spaceKey": space,
+        "expand": "body.storage,version,space",
+        "limit": 1,
+    }
+    r = session.get(CONTENT_API, params=params, timeout=30)
+    if r.status_code == 401:
+        raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
+    r.raise_for_status()
+
+    j = r.json() or {}
+    results = j.get("results") or []
+    if not results:
+        raise RuntimeError(f"No page found: space={space}, title={title}")
+
+    item = results[0]
+    body_html = ""
+    body = (item.get("body") or {}).get("storage") or {}
+    if body.get("value"):
+        body_html = body["value"]
+
+    pid = str(item.get("id") or "")
+    return {
+        "id": pid,
+        "title": item.get("title") or title,
+        "space": ((item.get("space") or {}).get("key")) or space,
+        "version": ((item.get("version") or {}).get("number")) or 0,
+        "body_html": body_html,
+        "url": page_view_url(pid),
+    }
 
 if __name__ == "__main__":
-    # streamable-http → /mcp 엔드포인트 노출
-    app.run(host="0.0.0.0", port=9000)
+    # SSE(=Server-Sent Events) 전송 방식으로 실행
+    # Dockerfile 의 CMD가 "python -m app.main" 이므로 여기로 진입
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "9000"))
+    app.run_sse(host=host, port=port)
