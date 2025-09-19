@@ -166,11 +166,5 @@ if __name__ == "__main__":
     import os
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "9000"))
-
-    # FastMCP 2.x: run_http가 있으면 그걸 사용
-    run_http = getattr(app, "run_http", None)
-    if callable(run_http):
-        app.run_http(host=host, port=port)
-    else:
-        # 구버전 호환: run()에 transport 인자 넘겨 HTTP로 강제
-        app.run(transport="streamable-http", host=host, port=port)
+    transport = os.getenv("TRANSPORT", "sse")  # 기본 sse
+    app.run(transport=transport, host=host, port=port)
