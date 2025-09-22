@@ -1,4 +1,4 @@
-import os
+import os, re
 import typing as t
 import requests
 from urllib.parse import quote_plus
@@ -15,6 +15,11 @@ VERIFY_SSL = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
+
+CQL_MAX = 120
+_CQL_BAD = re.compile(r'["\n\r\t]+')
+_STOP = {"task","guidelines","output","chat","history","assistant","user",
+         "제목","태그","대화","요약","가이드","출력"}
 
 # Confluence Server(/Data Center) 표준 REST 경로
 #   - 검색:        /rest/api/search?cql=...
@@ -40,6 +45,17 @@ session.headers.update({
 # ──────────────────────────────────────────────────────────────
 app = FastMCP("Confluence MCP")
 
+def _keywords(s: str, max_terms: int = 6) -> str:
+    toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s or "")
+    toks = [t for t in toks if t.lower() not in _STOP]
+    return " ".join(toks[:max_terms])
+
+def _to_cql_text(q: str) -> str:
+    q = _keywords(q) or (q or "")
+    q = _CQL_BAD.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q[:CQL_MAX]
+
 def _cql(query: str, space: t.Optional[str]) -> str:
     # CQL 예: type=page AND text ~ "foo" AND space=ENG
     parts = [ 'type=page', f'text ~ "{query}"' ]
@@ -50,24 +66,30 @@ def _cql(query: str, space: t.Optional[str]) -> str:
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
     """
-    Confluence CQL로 페이지 검색.
-    - query: 검색어 (CQL text~)
-    - space: (선택) 스페이스 키
-    - limit: 최대 결과 수
-    반환: [{id, title, url, excerpt}] 리스트
+    Confluence CQL 페이지 검색 (질의 정제 + 400 복구).
+    반환: [{id, title, url, excerpt}]
     """
-    if not query or not query.strip():
+    text = _to_cql_text(query or "")
+    if not text:
         return []
 
-    cql = _cql(query.strip(), space)
+    parts = ['type=page', f'text ~ "{text}"']
+    if space:
+        parts.append(f"space={space}")
+    cql = " AND ".join(parts)
+
     params = {
         "cql": cql,
-        "limit": max(1, min(int(limit), 50)),
-        "expand": "space"  # 결과 parent 정보 등 확장
+        "limit": max(1, min(int(limit or 10), 50)),
+        "expand": "space"
     }
     r = session.get(SEARCH_API, params=params, timeout=30)
+    if r.status_code == 400:
+        return []  # 오염된 질의 → 빈 결과로
     if r.status_code == 401:
         raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
+    if r.status_code == 403:
+        raise RuntimeError("Confluence policy/permission (403).")
     r.raise_for_status()
 
     data = r.json() or {}
