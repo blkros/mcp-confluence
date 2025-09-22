@@ -22,15 +22,20 @@ def rag_query(q: str, k: int) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json() or {}
 
-def rag_upsert_docs(docs: List[Dict[str, Any]]) -> None:
+def rag_upsert_docs(docs):
     payload = {"docs": docs}
-    # 1차: /upsert 시도
-    r = requests.post(f"{RAG}/upsert", json=payload, timeout=120)
-    if r.status_code >= 300:
-        # 2차: /ingest 백업 시도
-        r2 = requests.post(f"{RAG}/ingest", json=payload, timeout=120)
-        if r2.status_code >= 300:
-            raise HTTPException(500, f"RAG upsert failed: {r.text} / {r2.text}")
+    tried, last = [], None
+    for path in ["/upsert", "/ingest", "/v1/upsert", "/v1/ingest", "/documents/upsert"]:
+        url = f"{RAG}{path}"
+        try:
+            r = requests.post(url, json=payload, timeout=120)
+            tried.append(f"{path}:{r.status_code}")
+            if r.status_code < 300:
+                return
+        except Exception as e:
+            tried.append(f"{path}:EXC:{e}")
+            last = str(e)
+    raise HTTPException(500, f"RAG upsert failed. Tried={tried} last={last}")
 
 # --- MCP HTTP Wrapper 유틸 ---
 def mcp_conf_search(query: str, limit: int) -> List[Dict[str, Any]]:
