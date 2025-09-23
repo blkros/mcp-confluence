@@ -1,18 +1,19 @@
 # mcp-confluence/main.py
+
 import os, re
 import typing as t
-import requests
 from urllib.parse import quote_plus
-
+import httpx  # [FIX] httpx만 사용
+# import requests  # [REMOVED]
 from fastmcp import FastMCP
 
 # ──────────────────────────────────────────────────────────────
 # 환경변수
 # ──────────────────────────────────────────────────────────────
-BASE_URL = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
-USER = os.environ.get("CONFLUENCE_USER") or ""
-PASSWORD = os.environ.get("CONFLUENCE_PASSWORD") or ""
-VERIFY_SSL = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
+BASE_URL    = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
+USER        = os.environ.get("CONFLUENCE_USER") or ""
+PASSWORD    = os.environ.get("CONFLUENCE_PASSWORD") or ""
+VERIFY_SSL  = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
@@ -22,24 +23,12 @@ _CQL_BAD = re.compile(r'["\n\r\t]+')
 _STOP = {"task","guidelines","output","chat","history","assistant","user",
          "제목","태그","대화","요약","가이드","출력"}
 
-# Confluence Server(/Data Center) 표준 REST 경로
-#   - 검색:        /rest/api/search?cql=...
-#   - 콘텐츠 조회: /rest/api/content/{id}?expand=...
-SEARCH_API = f"{BASE_URL}/rest/api/search"
+# Confluence Server/DC 표준 REST 경로
+SEARCH_API  = f"{BASE_URL}/rest/api/search"
 CONTENT_API = f"{BASE_URL}/rest/api/content"
 
-# 보기 URL (Confluence Server 기본)
 def page_view_url(page_id: str) -> str:
-    # Data Center/Server 공통적으로 동작하는 기본 보기 링크
     return f"{BASE_URL}/pages/viewpage.action?pageId={page_id}"
-
-# 세션 (Basic Auth)
-session = requests.Session()
-session.auth = (USER, PASSWORD)
-session.verify = VERIFY_SSL
-session.headers.update({
-    "Accept": "application/json",
-})
 
 # ──────────────────────────────────────────────────────────────
 # FastMCP 앱
@@ -57,12 +46,45 @@ def _to_cql_text(q: str) -> str:
     q = re.sub(r"\s+", " ", q).strip()
     return q[:CQL_MAX]
 
-def _cql(query: str, space: t.Optional[str]) -> str:
-    # CQL 예: type=page AND text ~ "foo" AND space=ENG
-    parts = [ 'type=page', f'text ~ "{query}"' ]
-    if space:
-        parts.append(f"space={space}")
-    return " AND ".join(parts)
+# ──────────────────────────────────────────────────────────────
+# Basic 먼저 → 401이면 폼 로그인(JSESSIONID) 폴백
+# ──────────────────────────────────────────────────────────────
+def get_confluence_client() -> httpx.Client:
+    headers = {"Accept": "application/json"}
+
+    # 1) Basic 먼저
+    if USER and PASSWORD:
+        c = httpx.Client(
+            base_url=BASE_URL, headers=headers,
+            auth=httpx.BasicAuth(USER, PASSWORD),
+            verify=VERIFY_SSL, timeout=30.0
+        )
+        r = c.get("/rest/api/space?limit=1")
+        if r.status_code != 401:
+            return c  # Basic 성공
+        c.close()
+
+    # 2) 폼 로그인 폴백
+    c = httpx.Client(
+        base_url=BASE_URL, headers=headers,
+        verify=VERIFY_SSL, timeout=30.0, follow_redirects=True
+    )
+    form = {
+        "os_username": USER,
+        "os_password": PASSWORD,
+        "os_destination": "/",  # 로그인 성공 후 리다이렉트
+    }
+    c.post("/dologin.action", data=form, headers={"X-Atlassian-Token": "no-check"})
+    # 세션 확인
+    cr = c.get("/rest/api/space?limit=1")
+    if cr.status_code == 401:
+        c.close()
+        raise RuntimeError("Confluence auth failed (Basic & Cookie both). Check policy/SSO.")
+    return c
+
+# ──────────────────────────────────────────────────────────────
+# Tools
+# ──────────────────────────────────────────────────────────────
 
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
@@ -84,9 +106,16 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
         "limit": max(1, min(int(limit or 10), 50)),
         "expand": "space"
     }
-    r = session.get(SEARCH_API, params=params, timeout=30)
+
+    # 전역 requests.Session() 대신, 폼로그인 폴백 클라이언트 사용
+    client = get_confluence_client()
+    try:
+        r = client.get(SEARCH_API, params=params)
+    finally:
+        client.close()
+
     if r.status_code == 400:
-        return []  # 오염된 질의 → 빈 결과로
+        return []  # 오염된 질의 → 빈 결과
     if r.status_code == 401:
         raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
     if r.status_code == 403:
@@ -122,7 +151,14 @@ def get_page(page_id: str) -> dict:
 
     url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
     params = {"expand": "body.storage,version,space"}
-    r = session.get(url, params=params, timeout=30)
+
+    # 폼로그인 폴백 클라이언트 사용
+    client = get_confluence_client()
+    try:
+        r = client.get(url, params=params)
+    finally:
+        client.close()
+
     if r.status_code == 401:
         raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
     if r.status_code == 404:
@@ -159,7 +195,14 @@ def get_page_by_title(space: str, title: str) -> dict:
         "expand": "body.storage,version,space",
         "limit": 1,
     }
-    r = session.get(CONTENT_API, params=params, timeout=30)
+
+    # 폼로그인 폴백 클라이언트 사용
+    client = get_confluence_client()
+    try:
+        r = client.get(CONTENT_API, params=params)
+    finally:
+        client.close()
+
     if r.status_code == 401:
         raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
     r.raise_for_status()
@@ -186,7 +229,6 @@ def get_page_by_title(space: str, title: str) -> dict:
     }
 
 if __name__ == "__main__":
-    import os
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "9000"))
     transport = os.getenv("TRANSPORT", "sse")  # 기본 sse
