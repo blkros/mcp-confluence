@@ -203,16 +203,50 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
 # --- search: RAG용(본문 포함) --------------------------------
 @app.tool()
 def search(query: str, top_k: int = 5, space: t.Optional[str] = None) -> t.List[dict]:
+    """
+    RAG 프록시 호환 검색:
+    - id, title, url, space, version
+    - body: 본문 텍스트 (← rag-proxy mcp_search가 기대하는 키)
+    - text: body와 동일(호환성)
+    - excerpt: 있으면 유지
+    """
     items = _search_pages_impl(query=query, space=space, limit=top_k) or []
     out: t.List[dict] = []
+
     for it in items:
         pid = it.get("id")
+        title = it.get("title") or ""
+        url = it.get("url") or ""
+        excerpt = it.get("excerpt") or ""
+
+        body_txt = ""
+        space_key = ""
+        version = 0
+
         try:
             page = _get_page_impl(pid)
-            text = _html_to_text(page.get("body_html") or "")
-            out.append({**it, "text": text, "space": page.get("space") or "", "version": page.get("version") or 0})
+            # 제목 보강(HTML 폴백에서 placeholder인 경우)
+            if not title and page.get("title"):
+                title = page["title"]
+            # 본문 텍스트 추출
+            body_txt = _html_to_text(page.get("body_html") or "")
+            space_key = page.get("space") or ""
+            version = page.get("version") or 0
         except Exception:
-            out.append({**it, "text": ""})
+            # 본문 조회 실패 시 발췌라도
+            body_txt = excerpt or ""
+
+        out.append({
+            "id": pid,
+            "title": title or f"Page {pid}",
+            "url": url,
+            "space": space_key,
+            "version": version,
+            "body": body_txt,     # ★ rag-proxy가 쓰는 필드
+            "text": body_txt,     # 호환성 유지
+            "excerpt": excerpt,
+        })
+
     return out
 
 # 간단 HTML 태그 제거
