@@ -219,7 +219,7 @@ def search(query: str, top_k: int = 5, space: t.Optional[str] = None) -> t.List[
 def _strip_html(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
-# /dosearchsite.action HTML 검색 폴백
+# /dosearchsite.action HTML 검색 폴백 (견고 버전)
 def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[str], limit: int) -> t.List[dict]:
     text = _to_cql_text(query or "")
     if not text:
@@ -242,39 +242,54 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
         return []
 
     html = r.text
+
+    # 1) 일단 pageId를 가장 단순한 패턴으로 모두 수집
+    ids: t.List[str] = []
+    for pid in re.findall(r'/pages/viewpage\.action\?pageId=(\d+)', html):
+        if pid not in ids:
+            ids.append(pid)
+        if len(ids) >= max(1, min(int(limit or 10), 50)):
+            break
+
     out: t.List[dict] = []
-    seen = set()
+    for pid in ids:
+        title = ""
+        excerpt = ""
 
-    for m in re.finditer(
-        r'<a[^>]+href="[^"]*/pages/viewpage\.action\?pageId=(\d+)"[^>]*>(.*?)</a>',
-        html, flags=re.I | re.S
-    ):
-        pid = m.group(1)
-        title = _strip_html(m.group(2))
-        if not pid or not title or pid in seen:
-            continue
-        seen.add(pid)
-
-        # 근처에서 발췌 찾기(있으면)
-        start = max(0, m.start() - 500)
-        chunk = html[start:m.end() + 500]
-        ex = ""
-        mm = re.search(
-            r'(?:class="[^"]*(?:excerpt|summary|search-result[^"]*)[^"]*">)(.*?)(?:</(?:div|p)>)',
-            chunk, flags=re.I | re.S
+        # 2) 해당 pageId를 가진 앵커의 innerText 시도(따옴표 양쪽 다 허용)
+        am = re.search(
+            rf'<a[^>]+href=[\'"][^\'"]*/pages/viewpage\.action\?pageId={pid}[\'"][^>]*>(.*?)</a>',
+            html, flags=re.I | re.S
         )
-        if mm:
-            ex = _strip_html(mm.group(1))
+        if am:
+            title = _strip_html(am.group(1))
+            # 근처에서 발췌
+            start = max(0, am.start() - 500)
+            chunk = html[start:am.end() + 500]
+            mm = re.search(
+                r'(?:class="[^"]*(?:excerpt|summary|search-result[^"]*)[^"]*">)(.*?)(?:</(?:div|p)>)',
+                chunk, flags=re.I | re.S
+            )
+            if mm:
+                excerpt = _strip_html(mm.group(1))
+
+        # 3) 앵커 텍스트가 없으면 REST로 제목 보강
+        if not title:
+            rr = client.get(f"{CONTENT_API}/{quote_plus(pid)}", params={"expand": "version,space"})
+            ct = (rr.headers.get("content-type") or "").lower()
+            if rr.status_code == 200 and "application/json" in ct:
+                try:
+                    title = (rr.json() or {}).get("title") or ""
+                except Exception:
+                    pass
 
         out.append({
             "id": pid,
-            "title": title,
+            "title": title or f"Page {pid}",
             "url": page_view_url(pid),
-            "excerpt": ex,
+            "excerpt": excerpt,
         })
 
-        if len(out) >= max(1, min(int(limit or 10), 50)):
-            break
     return out
 
 
