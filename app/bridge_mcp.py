@@ -65,18 +65,29 @@ def search_and_ingest(req: SearchAndIngestReq):
 
     # 1) 1차 조회
     qres = rag_query(q, k)
-    hits = qres.get("hits", []) or []
-    top_score = qres.get("top_score")
-    if top_score is None and hits:
-        top_score = hits[0].get("score", 0.0)
-    top_score = float(top_score or 0.0)
+
+    # rag-proxy 응답 호환: items(list), hits(int)
+    items = []
+    if isinstance(qres, dict):
+        if isinstance(qres.get("items"), list):
+            items = qres["items"]
+        elif isinstance(qres.get("hits"), list):  # 구버전 호환
+            items = qres["hits"]
+
+    def _best_score(xs):
+        try:
+            return max(float(x.get("score") or 0.0) for x in xs) if xs else 0.0
+        except Exception:
+            return 0.0
+
+    top_score = float(qres.get("top_score") or _best_score(items))
 
     used_fallback = False
     if top_score < th:
         # 2) MCP 검색 → 본문 수집 → 업서트
-        items = mcp_conf_search(q, limit=req.max_pages or k)
+        found = mcp_conf_search(q, limit=req.max_pages or k)
         new_docs: List[Dict[str, Any]] = []
-        for it in items:
+        for it in found:
             pid = it.get("page_id")
             if not pid:
                 continue
@@ -87,7 +98,7 @@ def search_and_ingest(req: SearchAndIngestReq):
                 continue
             new_docs.append({
                 "id": f"confluence:{pid}",
-                "text": text[:200_000],  # 안전상 길이 제한
+                "text": text[:200_000],
                 "metadata": {
                     "source": "confluence",
                     "title": title,
@@ -99,13 +110,10 @@ def search_and_ingest(req: SearchAndIngestReq):
             used_fallback = True
             # 3) 재조회
             qres = rag_query(q, k)
-            hits = qres.get("hits", []) or []
-            top_score = qres.get("top_score")
-            if top_score is None and hits:
-                top_score = hits[0].get("score", 0.0)
-            top_score = float(top_score or 0.0)
+            items = qres.get("items") or []
+            top_score = float(qres.get("top_score") or _best_score(items))
 
-    # 4) 스니펫 반환
+    # 4) 스니펫 반환 (items 기준으로 생성)
     return {
         "used_fallback": used_fallback,
         "top_score": top_score,
@@ -114,6 +122,6 @@ def search_and_ingest(req: SearchAndIngestReq):
                 "chunk": (h.get("text") or "")[:1200],
                 "score": float(h.get("score") or 0.0),
                 "meta":  h.get("metadata") or {}
-            } for h in hits
+            } for h in (items or [])
         ]
     }
