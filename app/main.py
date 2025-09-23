@@ -286,6 +286,38 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
             client.close()
 
 @app.tool()
+def search(query: str, top_k: int = 5, space: t.Optional[str] = None) -> t.List[dict]:
+    """
+    Generic search tool for RAG proxies.
+    Returns items with {id, title, url, excerpt, text} where `text` is plain text body for embedding.
+    """
+    # 1) 메타 검색
+    items = search_pages(query=query, space=space, limit=top_k) or []
+
+    # 2) 본문 가져와서 text 필드 채우기 (인덱싱용)
+    out: t.List[dict] = []
+    for it in items:
+        pid = it.get("id")
+        try:
+            page = get_page(pid)
+            # HTML → 텍스트 간단 변환 (개행/공백 정리, 너무 크면 자르기)
+            body_html = page.get("body_html") or ""
+            text = re.sub(r"<[^>]+>", " ", body_html)
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > 20000:
+                text = text[:20000]
+            out.append({
+                **it,
+                "text": text,
+                "space": page.get("space") or "",
+                "version": page.get("version") or 0,
+            })
+        except Exception:
+            # 본문 실패해도 메타만이라도
+            out.append({**it, "text": ""})
+    return out
+
+@app.tool()
 def get_page(page_id: str) -> dict:
     """
     페이지 ID로 본문(HTML)과 메타데이터를 조회.
