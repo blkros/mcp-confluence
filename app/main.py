@@ -85,6 +85,80 @@ def get_confluence_client() -> httpx.Client:
 # ──────────────────────────────────────────────────────────────
 # Tools
 # ──────────────────────────────────────────────────────────────
+# 간단 HTML 태그 제거
+def _strip_html(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s or "").strip()
+
+# /dosearchsite.action HTML 검색 폴백
+def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[str], limit: int) -> t.List[dict]:
+    # 검색어 정제
+    text = _to_cql_text(query or "")
+    if not text:
+        return []
+
+    # 6.12 UI 검색 페이지 파라미터
+    params = {
+        "queryString": text,
+        "contentType": "page",
+    }
+    if space:
+        params["where"] = "conf_space"
+        params["spaceKey"] = space
+    else:
+        params["where"] = "conf_all"
+
+    # HTML로 내려오므로 Accept는 text/html
+    r = client.get(
+        "/dosearchsite.action",
+        params=params,
+        headers={"Accept": "text/html"},
+        timeout=30.0,
+    )
+    if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
+        return []
+
+    html = r.text
+
+    out: t.List[dict] = []
+    seen = set()
+
+    # 1) 결과 링크에서 pageId와 제목 추출
+    #    예: <a href="/pages/viewpage.action?pageId=12345" ...>제목</a>
+    for m in re.finditer(
+        r'<a[^>]+href="[^"]*/pages/viewpage\.action\?pageId=(\d+)"[^>]*>(.*?)</a>',
+        html, flags=re.I | re.S
+    ):
+        pid = m.group(1)
+        title = _strip_html(m.group(2))
+        if not pid or not title:
+            continue
+        if pid in seen:
+            continue
+        seen.add(pid)
+
+        # 2) 근처에 스니펫(발췌) 있으면 추출 (여러 테마 대비, 느슨한 매칭)
+        #    근처 500자 범위 안에서 'excerpt' / 'summary' 류 클래스 블록을 탐색
+        start = max(0, m.start() - 500)
+        chunk = html[start:m.end() + 500]
+        ex = ""
+        mm = re.search(
+            r'(?:class="[^"]*(?:excerpt|summary|search-result[^"]*)[^"]*">)(.*?)(?:</(?:div|p)>)',
+            chunk, flags=re.I | re.S
+        )
+        if mm:
+            ex = _strip_html(mm.group(1))
+
+        out.append({
+            "id": pid,
+            "title": title,
+            "url": page_view_url(pid),
+            "excerpt": ex,
+        })
+
+        if len(out) >= max(1, min(int(limit or 10), 50)):
+            break
+
+    return out
 
 # JSON 가드 헬퍼
 def _json_or_none(r):
@@ -99,14 +173,15 @@ def _json_or_none(r):
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
     """
-    Confluence CQL 페이지 검색 (6.12 호환: /rest/api/search 고정 + JSON 가드)
+    Confluence 검색 (6.12 호환):
+      1) REST CQL (/rest/api/content/search → /rest/api/search 순서) 시도
+      2) 403/HTML/빈결과면 UI 검색(/dosearchsite.action) HTML 파싱 폴백
     반환: [{id, title, url, excerpt}]
     """
     text = _to_cql_text(query or "")
     if not text:
         return []
 
-    # ── CHANGED: CQL 시나리오 몇 개를 순차로 시도 (title/text 문장, 토큰 AND, title 토큰 OR)
     def _cql_attempts(text: str, space: t.Optional[str]) -> t.List[str]:
         base_parts = ['type=page']
         if space:
@@ -122,9 +197,7 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
 
     attempts = _cql_attempts(text, space)
 
-    # ── CHANGED: 6.12 호환 – 기본적으로 /rest/api/search만 사용
-    SEARCH_ENDPOINT = f"{BASE_URL}/rest/api/search"
-
+    ENDPOINTS = (SEARCH_API_PRIMARY, SEARCH_API_FALLBACK)
     headers = {
         "X-Atlassian-Token": "no-check",
         "X-Requested-With": "XMLHttpRequest",
@@ -137,41 +210,44 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
             params = {
                 "cql": cql,
                 "limit": max(1, min(int(limit or 10), 50)),
-                "expand": "space"
+                "expand": "space",
             }
-            r = client.get(SEARCH_ENDPOINT, params=params, headers=headers)
+            for endpoint in ENDPOINTS:
+                r = client.get(endpoint, params=params, headers=headers, timeout=30.0)
 
-            # ── NEW: JSON 가드 – JSON 아니라면 다음 시나리오로
-            data = _json_or_none(r)
-            if r.status_code == 401:
-                raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
-            if r.status_code in (400, 403, 404, 501) or data is None:
-                # 400 질의오류 / 403 정책 / 404 미지원 / 501 등 → 다음 CQL 시도
-                continue
+                if r.status_code == 401:
+                    raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
 
-            results = (data.get("results") or [])
-            if not results:
-                continue
+                ct = (r.headers.get("content-type") or "").lower()
+                is_json = "application/json" in ct
+                if r.status_code in (400, 403, 404, 501) or not is_json:
+                    # 다음 엔드포인트/다음 CQL로 시도
+                    continue
 
-            out: t.List[dict] = []
-            for it in results:
-                content = (it or {}).get("content") or {}
-                page_id = str(content.get("id") or it.get("id") or "")
-                title = (content.get("title") or it.get("title") or "").strip()
-                excerpt = (it.get("excerpt") or "").strip()
-                if page_id and title:
-                    out.append({
-                        "id": page_id,
-                        "title": title,
-                        "url": page_view_url(page_id),
-                        "excerpt": excerpt,
-                    })
-            if out:
-                return out
+                data = r.json() or {}
+                results = data.get("results") or []
+                out: t.List[dict] = []
+                for it in results:
+                    content = (it or {}).get("content") or {}
+                    page_id = str(content.get("id") or it.get("id") or "")
+                    title = (content.get("title") or it.get("title") or "").strip()
+                    excerpt = (it.get("excerpt") or "").strip()
+                    if page_id and title:
+                        out.append({
+                            "id": page_id,
+                            "title": title,
+                            "url": page_view_url(page_id),
+                            "excerpt": excerpt,
+                        })
+                if out:
+                    return out
+
+        # 둘 다 실패/빈결과면 HTML 폴백
+        return _html_search_fallback(client, query, space, limit)
+
     finally:
         client.close()
 
-    return []
 
 
 
