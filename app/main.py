@@ -248,21 +248,36 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
 
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
-    return _search_pages_impl(query, space, limit)
+    items = _search_pages_impl(query, space, limit) or []
+    # excerpt 비면 간단 보강
+    if items:
+        c = get_cookie_client()
+        try:
+            for it in items:
+                if not (it.get("excerpt") or "").strip():
+                    pid = it.get("id")
+                    r = c.get("/plugins/viewstorage/viewpagestorage.action",
+                              params={"pageId": pid}, headers={"Accept":"text/html"}, timeout=20.0)
+                    if r.status_code == 200:
+                        txt = _html_to_text(r.text)
+                        it["excerpt"] = txt[:300]
+        finally:
+            c.close()
+    return items
 
 # --- search: RAG용(본문 포함) --------------------------------
 @app.tool()
-def search(query: str, top_k: int = 5, space: t.Optional[str] = None) -> t.List[dict]:
-    """
-    RAG 프록시 호환 검색:
-    - id, title, url, space, version
-    - body: 본문 텍스트 (← rag-proxy mcp_search가 기대하는 키)
-    - text: body와 동일(호환성)
-    - excerpt: 있으면 유지
-    """
-    items = _search_pages_impl(query=query, space=space, limit=top_k) or []
-    out: t.List[dict] = []
+def search(
+    query: str,
+    top_k: int = 5,
+    limit: t.Optional[int] = None,          # ← rag-proxy가 쓰는 이름도 허용
+    space: t.Optional[str] = None
+) -> t.List[dict]:
+    # limit 우선, 없으면 top_k
+    k = int(limit) if (isinstance(limit, int) and limit > 0) else int(top_k)
 
+    items = _search_pages_impl(query=query, space=space, limit=k) or []
+    out: t.List[dict] = []
     for it in items:
         pid = it.get("id")
         title = it.get("title") or ""
@@ -275,16 +290,15 @@ def search(query: str, top_k: int = 5, space: t.Optional[str] = None) -> t.List[
 
         try:
             page = _get_page_impl(pid)
-            # 제목 보강(HTML 폴백에서 placeholder인 경우)
             if not title and page.get("title"):
                 title = page["title"]
-            # 본문 텍스트 추출
-            body_txt = _html_to_text(page.get("body_html") or "")
+            body_html = page.get("body_html") or ""
+            body_txt = _html_to_text(body_html)
             space_key = page.get("space") or ""
             version = page.get("version") or 0
         except Exception:
-            # 본문 조회 실패 시 발췌라도
-            body_txt = excerpt or ""
+            # 본문 조회 실패 시에도 빈 문자열 방지: 발췌/제목으로라도 채움
+            body_txt = excerpt or title or ""
 
         out.append({
             "id": pid,
@@ -292,12 +306,12 @@ def search(query: str, top_k: int = 5, space: t.Optional[str] = None) -> t.List[
             "url": url,
             "space": space_key,
             "version": version,
-            "body": body_txt,     # ★ rag-proxy가 쓰는 필드
-            "text": body_txt,     # 호환성 유지
+            "body": body_txt,   # ← rag-proxy가 읽는 키
+            "text": body_txt,   # 호환
             "excerpt": excerpt,
         })
-
     return out
+
 
 # 간단 HTML 태그 제거
 def _strip_html(s: str) -> str:
