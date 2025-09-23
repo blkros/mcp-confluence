@@ -169,6 +169,27 @@ def _json_or_none(r):
         return r.json()
     except Exception:
         return None
+    
+
+def get_cookie_client() -> httpx.Client:
+    headers = {"Accept": "application/json"}
+    c = httpx.Client(
+        base_url=BASE_URL, headers=headers,
+        verify=VERIFY_SSL, timeout=30.0, follow_redirects=True
+    )
+    form = {
+        "os_username": USER,
+        "os_password": PASSWORD,
+        "os_destination": "/",
+    }
+    c.post("/dologin.action", data=form, headers={"X-Atlassian-Token": "no-check"})
+    # 로그인 확인 (401이면 실패)
+    cr = c.get("/rest/api/space?limit=1")
+    if cr.status_code == 401:
+        c.close()
+        raise RuntimeError("Confluence cookie auth failed. Check policy/SSO.")
+    return c
+
 
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
@@ -204,8 +225,10 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
         "Accept": "application/json",
     }
 
+    # 1) 우선 기존 로직대로 클라이언트 하나 생성(대개 Basic)
     client = get_confluence_client()
     try:
+        # 1-1) REST 엔드포인트들로 CQL 순차 시도
         for cql in attempts:
             params = {
                 "cql": cql,
@@ -221,7 +244,7 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
                 ct = (r.headers.get("content-type") or "").lower()
                 is_json = "application/json" in ct
                 if r.status_code in (400, 403, 404, 501) or not is_json:
-                    # 다음 엔드포인트/다음 CQL로 시도
+                    # 다음 엔드포인트/다음 CQL로
                     continue
 
                 data = r.json() or {}
@@ -242,14 +265,25 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
                 if out:
                     return out
 
-        # 둘 다 실패/빈결과면 HTML 폴백
-        return _html_search_fallback(client, query, space, limit)
-
+        # 2) REST가 막혔거나 결과가 비었으면 → HTML 폴백.
+        #    이때 Basic 클라이언트면 쿠키가 없으므로 쿠키 세션으로 바꿔서 호출
+        needs_cookie = (client.auth is not None)
     finally:
         client.close()
 
-
-
+    if needs_cookie:
+        client = get_cookie_client()
+        try:
+            return _html_search_fallback(client, query, space, limit)
+        finally:
+            client.close()
+    else:
+        # 이미 쿠키 세션이었다면 바로 폴백
+        client = get_confluence_client()  # 쿠키 세션 재확보용
+        try:
+            return _html_search_fallback(client, query, space, limit)
+        finally:
+            client.close()
 
 @app.tool()
 def get_page(page_id: str) -> dict:
