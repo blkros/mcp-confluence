@@ -89,67 +89,96 @@ def get_confluence_client() -> httpx.Client:
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
     """
-    Confluence CQL 페이지 검색 (질의 정제 + 400 복구).
+    Confluence CQL 페이지 검색 (여러 CQL 전략을 순차 시도).
     반환: [{id, title, url, excerpt}]
     """
     text = _to_cql_text(query or "")
     if not text:
         return []
 
-    parts = ['type=page', f'text ~ "{text}"']
-    if space:
-        parts.append(f"space={space}")
-    cql = " AND ".join(parts)
+    # ── NEW: CQL 시나리오 여러 개 준비 (title OR text) → 토큰 AND → title 토큰 OR
+    def _cql_attempts(text: str, space: t.Optional[str]) -> t.List[str]:
+        base_parts = ['type=page']
+        if space:
+            base_parts.append(f"space={space}")
+        base = " AND ".join(base_parts)
 
-    params = {
-        "cql": cql,
-        "limit": max(1, min(int(limit or 10), 50)),
-        "expand": "space"
+        toks = [t for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", text) if t.lower() not in _STOP]
+        toks = toks[:4]  # 너무 많으면 400 나올 수 있어 컷
+
+        attempts = [
+            # CHANGED: 긴 문장도 title/text 둘 다 매칭 시도
+            f'{base} AND (title ~ "{text}" OR text ~ "{text}")'
+        ]
+        if toks:
+            # NEW: 토큰들을 AND로 묶어서 text 매칭(정확도↑)
+            attempts.append(base + " AND " + " AND ".join([f'text ~ "{t}"' for t in toks]))
+            # NEW(옵션): title만 토큰 OR 매칭(회수↑)
+            attempts.append(base + " AND (" + " OR ".join([f'title ~ "{t}"' for t in toks]) + ")")
+        return attempts
+
+    attempts = _cql_attempts(text, space)
+
+    # 일부 환경에선 이 헤더 있어야 403 안 뜨는 경우가 있어 같이 넣음
+    headers = {
+        "X-Atlassian-Token": "no-check",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json",
     }
 
     client = get_confluence_client()
     try:
-        # 일부 보안/SSO 환경에서 필요한 경우가 있어 같이 넣어줌
-        headers = {
-            "X-Atlassian-Token": "no-check",
-            "X-Requested-With": "XMLHttpRequest",
-        }
+        for cql in attempts:
+            params = {
+                "cql": cql,
+                "limit": max(1, min(int(limit or 10), 50)),
+                "expand": "space",
+            }
 
-        # 1차: content/search 로 시도
-        r = client.get(SEARCH_API_PRIMARY, params=params, headers=headers)
+            # 1차: /rest/api/content/search
+            r = client.get(SEARCH_API_PRIMARY, params=params, headers=headers)
+            # 2차: /rest/api/search (일부 정책/버전에서 필요)
+            if r.status_code in (403, 404, 501):
+                r = client.get(SEARCH_API_FALLBACK, params=params, headers=headers)
 
-        # 2차: 403/404/501 류면 /rest/api/search 로 한번 더 시도
-        if r.status_code in (403, 404, 501):
-            r = client.get(SEARCH_API_FALLBACK, params=params, headers=headers)
+            # 400: 질의 형식 문제 → 다음 시나리오로
+            if r.status_code == 400:
+                continue
+            # 401: 인증 문제 → 바로 에러
+            if r.status_code == 401:
+                raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
+            # 403: 정책으로 막힘 → 다음 시나리오로
+            if r.status_code == 403:
+                continue
+
+            r.raise_for_status()
+            data = r.json() or {}
+            results = data.get("results") or []
+            if not results:
+                # 결과 없으면 다음 시나리오
+                continue
+
+            # ── CHANGED: /content/search(상위에 id/title)와 /search(하위 content.id/title) 모두 커버
+            out: t.List[dict] = []
+            for it in results:
+                content = (it or {}).get("content") or {}
+                page_id = str(it.get("id") or content.get("id") or "")
+                title = (it.get("title") or content.get("title") or "").strip()
+                excerpt = (it.get("excerpt") or "").strip()
+                if page_id and title:
+                    out.append({
+                        "id": page_id,
+                        "title": title,
+                        "url": page_view_url(page_id),
+                        "excerpt": excerpt,
+                    })
+            if out:
+                return out  # 첫 번째로 뭔가라도 건진 시나리오를 바로 반환
     finally:
         client.close()
 
-    if r.status_code == 400:
-        return []  # 오염 질의 → 빈 결과
-    if r.status_code == 401:
-        raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
-    if r.status_code == 403:
-        # 권한 정책으로 막히면 어차피 결과가 안 오니, 여기선 빈 결과로 돌려 로그 소음 줄일 수도 있음
-        return []
-    r.raise_for_status()
+    return []
 
-    data = r.json() or {}
-    results = data.get("results") or []
-
-    out: t.List[dict] = []
-    for it in results:
-        content = (it or {}).get("content") or {}
-        page_id = str(content.get("id") or it.get("id") or "")
-        title = content.get("title") or it.get("title") or ""
-        excerpt = (it.get("excerpt") or "").strip()
-        if page_id and title:
-            out.append({
-                "id": page_id,
-                "title": title,
-                "url": page_view_url(page_id),
-                "excerpt": excerpt,
-            })
-    return out
 
 @app.tool()
 def get_page(page_id: str) -> dict:
