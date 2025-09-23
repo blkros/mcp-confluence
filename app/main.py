@@ -3,8 +3,7 @@
 import os, re
 import typing as t
 from urllib.parse import quote_plus
-import httpx  # [FIX] httpx만 사용
-# import requests  # [REMOVED]
+import httpx
 from fastmcp import FastMCP
 
 # ──────────────────────────────────────────────────────────────
@@ -24,8 +23,9 @@ _STOP = {"task","guidelines","output","chat","history","assistant","user",
          "제목","태그","대화","요약","가이드","출력"}
 
 # Confluence Server/DC 표준 REST 경로
-SEARCH_API  = f"{BASE_URL}/rest/api/search"
-CONTENT_API = f"{BASE_URL}/rest/api/content"
+SEARCH_API_PRIMARY   = f"{BASE_URL}/rest/api/content/search"
+SEARCH_API_FALLBACK  = f"{BASE_URL}/rest/api/search"
+CONTENT_API          = f"{BASE_URL}/rest/api/content"
 
 def page_view_url(page_id: str) -> str:
     return f"{BASE_URL}/pages/viewpage.action?pageId={page_id}"
@@ -107,19 +107,30 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
         "expand": "space"
     }
 
-    # 전역 requests.Session() 대신, 폼로그인 폴백 클라이언트 사용
     client = get_confluence_client()
     try:
-        r = client.get(SEARCH_API, params=params)
+        # 일부 보안/SSO 환경에서 필요한 경우가 있어 같이 넣어줌
+        headers = {
+            "X-Atlassian-Token": "no-check",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        # 1차: content/search 로 시도
+        r = client.get(SEARCH_API_PRIMARY, params=params, headers=headers)
+
+        # 2차: 403/404/501 류면 /rest/api/search 로 한번 더 시도
+        if r.status_code in (403, 404, 501):
+            r = client.get(SEARCH_API_FALLBACK, params=params, headers=headers)
     finally:
         client.close()
 
     if r.status_code == 400:
-        return []  # 오염된 질의 → 빈 결과
+        return []  # 오염 질의 → 빈 결과
     if r.status_code == 401:
         raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
     if r.status_code == 403:
-        raise RuntimeError("Confluence policy/permission (403).")
+        # 권한 정책으로 막히면 어차피 결과가 안 오니, 여기선 빈 결과로 돌려 로그 소음 줄일 수도 있음
+        return []
     r.raise_for_status()
 
     data = r.json() or {}
@@ -128,7 +139,7 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
     out: t.List[dict] = []
     for it in results:
         content = (it or {}).get("content") or {}
-        page_id = str(content.get("id") or "")
+        page_id = str(content.get("id") or it.get("id") or "")
         title = content.get("title") or it.get("title") or ""
         excerpt = (it.get("excerpt") or "").strip()
         if page_id and title:
