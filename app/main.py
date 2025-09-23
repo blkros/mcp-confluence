@@ -86,40 +86,45 @@ def get_confluence_client() -> httpx.Client:
 # Tools
 # ──────────────────────────────────────────────────────────────
 
+# JSON 가드 헬퍼
+def _json_or_none(r):
+    ct = (r.headers.get("content-type") or "").lower()
+    if "application/json" not in ct:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
 @app.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
     """
-    Confluence CQL 페이지 검색 (여러 CQL 전략을 순차 시도).
+    Confluence CQL 페이지 검색 (6.12 호환: /rest/api/search 고정 + JSON 가드)
     반환: [{id, title, url, excerpt}]
     """
     text = _to_cql_text(query or "")
     if not text:
         return []
 
-    # ── NEW: CQL 시나리오 여러 개 준비 (title OR text) → 토큰 AND → title 토큰 OR
+    # ── CHANGED: CQL 시나리오 몇 개를 순차로 시도 (title/text 문장, 토큰 AND, title 토큰 OR)
     def _cql_attempts(text: str, space: t.Optional[str]) -> t.List[str]:
         base_parts = ['type=page']
         if space:
             base_parts.append(f"space={space}")
         base = " AND ".join(base_parts)
+        toks = [t for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", text) if t.lower() not in _STOP][:4]
 
-        toks = [t for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", text) if t.lower() not in _STOP]
-        toks = toks[:4]  # 너무 많으면 400 나올 수 있어 컷
-
-        attempts = [
-            # CHANGED: 긴 문장도 title/text 둘 다 매칭 시도
-            f'{base} AND (title ~ "{text}" OR text ~ "{text}")'
-        ]
+        attempts = [f'{base} AND (title ~ "{text}" OR text ~ "{text}")']
         if toks:
-            # NEW: 토큰들을 AND로 묶어서 text 매칭(정확도↑)
             attempts.append(base + " AND " + " AND ".join([f'text ~ "{t}"' for t in toks]))
-            # NEW(옵션): title만 토큰 OR 매칭(회수↑)
             attempts.append(base + " AND (" + " OR ".join([f'title ~ "{t}"' for t in toks]) + ")")
         return attempts
 
     attempts = _cql_attempts(text, space)
 
-    # 일부 환경에선 이 헤더 있어야 403 안 뜨는 경우가 있어 같이 넣음
+    # ── CHANGED: 6.12 호환 – 기본적으로 /rest/api/search만 사용
+    SEARCH_ENDPOINT = f"{BASE_URL}/rest/api/search"
+
     headers = {
         "X-Atlassian-Token": "no-check",
         "X-Requested-With": "XMLHttpRequest",
@@ -132,38 +137,27 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
             params = {
                 "cql": cql,
                 "limit": max(1, min(int(limit or 10), 50)),
-                "expand": "space",
+                "expand": "space"
             }
+            r = client.get(SEARCH_ENDPOINT, params=params, headers=headers)
 
-            # 1차: /rest/api/content/search
-            r = client.get(SEARCH_API_PRIMARY, params=params, headers=headers)
-            # 2차: /rest/api/search (일부 정책/버전에서 필요)
-            if r.status_code in (403, 404, 501):
-                r = client.get(SEARCH_API_FALLBACK, params=params, headers=headers)
-
-            # 400: 질의 형식 문제 → 다음 시나리오로
-            if r.status_code == 400:
-                continue
-            # 401: 인증 문제 → 바로 에러
+            # ── NEW: JSON 가드 – JSON 아니라면 다음 시나리오로
+            data = _json_or_none(r)
             if r.status_code == 401:
                 raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
-            # 403: 정책으로 막힘 → 다음 시나리오로
-            if r.status_code == 403:
+            if r.status_code in (400, 403, 404, 501) or data is None:
+                # 400 질의오류 / 403 정책 / 404 미지원 / 501 등 → 다음 CQL 시도
                 continue
 
-            r.raise_for_status()
-            data = r.json() or {}
-            results = data.get("results") or []
+            results = (data.get("results") or [])
             if not results:
-                # 결과 없으면 다음 시나리오
                 continue
 
-            # ── CHANGED: /content/search(상위에 id/title)와 /search(하위 content.id/title) 모두 커버
             out: t.List[dict] = []
             for it in results:
                 content = (it or {}).get("content") or {}
-                page_id = str(it.get("id") or content.get("id") or "")
-                title = (it.get("title") or content.get("title") or "").strip()
+                page_id = str(content.get("id") or it.get("id") or "")
+                title = (content.get("title") or it.get("title") or "").strip()
                 excerpt = (it.get("excerpt") or "").strip()
                 if page_id and title:
                     out.append({
@@ -173,11 +167,12 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
                         "excerpt": excerpt,
                     })
             if out:
-                return out  # 첫 번째로 뭔가라도 건진 시나리오를 바로 반환
+                return out
     finally:
         client.close()
 
     return []
+
 
 
 @app.tool()
