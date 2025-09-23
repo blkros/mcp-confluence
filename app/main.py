@@ -107,28 +107,78 @@ def get_cookie_client() -> httpx.Client:
 def _get_page_impl(page_id: str) -> dict:
     if not page_id:
         raise ValueError("page_id is required")
-    url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
-    params = {"expand": "body.storage,version,space"}
-    client = get_confluence_client()
+    pid = str(page_id)
+
+    # 1) 쿠키 세션으로 REST 먼저 시도 (SSO 환경에서 성공률 ↑)
+    c = get_cookie_client()
     try:
-        r = client.get(url, params=params)
+        url = f"{CONTENT_API}/{quote_plus(pid)}"
+        params = {"expand": "body.storage,version,space"}
+        r = c.get(url, params=params, headers={"Accept": "application/json"})
+        ct = (r.headers.get("content-type") or "").lower()
+
+        if r.status_code == 200 and "application/json" in ct:
+            j = r.json() or {}
+            body_html = ((j.get("body") or {}).get("storage") or {}).get("value", "") or ""
+            return {
+                "id": str(j.get("id") or pid),
+                "title": j.get("title") or "",
+                "space": ((j.get("space") or {}).get("key")) or "",
+                "version": ((j.get("version") or {}).get("number")) or 0,
+                "body_html": body_html,
+                "url": page_view_url(str(j.get("id") or pid)),
+            }
+        # 200/JSON이 아니면 HTML 폴백으로 넘어감
     finally:
-        client.close()
-    if r.status_code == 401:
-        raise RuntimeError("Confluence auth failed (401). Check USER/PASSWORD or SSO policy.")
-    if r.status_code == 404:
-        raise RuntimeError(f"Page not found: {page_id}")
-    r.raise_for_status()
-    j = r.json() or {}
-    body_html = ((j.get("body") or {}).get("storage") or {}).get("value", "") or ""
-    return {
-        "id": str(j.get("id") or page_id),
-        "title": j.get("title") or "",
-        "space": ((j.get("space") or {}).get("key")) or "",
-        "version": ((j.get("version") or {}).get("number")) or 0,
-        "body_html": body_html,
-        "url": page_view_url(str(j.get("id") or page_id)),
-    }
+        c.close()
+
+    # 2) HTML 폴백: viewstorage(본문) + viewpage(메타)
+    c2 = get_cookie_client()
+    try:
+        # 2-1) 본문(storage format)
+        r_body = c2.get(
+            "/plugins/viewstorage/viewpagestorage.action",
+            params={"pageId": pid},
+            headers={"Accept": "text/html"},
+            timeout=30.0,
+        )
+        body_html = r_body.text if r_body.status_code == 200 else ""
+
+        # 2-2) 제목/스페이스/버전 (viewpage meta 태그 파싱)
+        r_meta = c2.get(
+            "/pages/viewpage.action",
+            params={"pageId": pid},
+            headers={"Accept": "text/html"},
+            timeout=30.0,
+        )
+        title = ""
+        space_key = ""
+        version = 0
+        if r_meta.status_code == 200:
+            html = r_meta.text
+            m = re.search(r'<meta\s+name="ajs-page-title"\s+content="([^"]*)"', html, re.I)
+            if m: title = m.group(1).strip()
+            m = re.search(r'<meta\s+name="ajs-space-key"\s+content="([^"]*)"', html, re.I)
+            if m: space_key = m.group(1).strip()
+            m = re.search(r'<meta\s+name="ajs-version-number"\s+content="(\d+)"', html, re.I)
+            if m:
+                try: version = int(m.group(1))
+                except: version = 0
+
+        if not (title or body_html):
+            # HTML 폴백도 실패하면 명시적으로 에러
+            raise RuntimeError(f"Page not accessible via REST/HTML: {pid}")
+
+        return {
+            "id": pid,
+            "title": title or f"Page {pid}",
+            "space": space_key,
+            "version": version,
+            "body_html": body_html,
+            "url": page_view_url(pid),
+        }
+    finally:
+        c2.close()
 
 @app.tool()
 def get_page(page_id: str) -> dict:
