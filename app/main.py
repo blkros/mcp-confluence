@@ -85,12 +85,26 @@ def get_confluence_client() -> httpx.Client:
 # ──────────────────────────────────────────────────────────────
 # Tools
 # ──────────────────────────────────────────────────────────────
-# --- helpers -------------------------------------------------
 def _html_to_text(html: str) -> str:
     import re
-    txt = re.sub(r"<[^>]+>", " ", html or "")
-    txt = re.sub(r"\s+", " ", txt).strip()
-    return txt[:20000]  # 과도한 본문 제한
+    s = html or ""
+    # 1) 통째 블록 제거
+    s = re.sub(r"(?is)<(head|script|style|noscript|template)[\s\S]*?</\1>", " ", s)
+    # 2) HTML 주석 제거
+    s = re.sub(r"(?is)<!--.*?-->", " ", s)
+    # 3) 줄바꿈 보존용 태그 치환
+    s = re.sub(r"(?is)<br\s*/?>", "\n", s)
+    s = re.sub(r"(?is)</p>", "\n", s)
+    # 4) 나머지 태그 제거
+    s = re.sub(r"<[^>]+>", " ", s)
+    # 5) JS 전역/리소스 키 흔적 약간 정리(선택)
+    s = re.sub(r"\b(WRM|AJS|window\.)[^\n]{0,200}", " ", s)
+    # 6) 공백/줄 정리
+    s = re.sub(r"[ \t]+\n", "\n", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip()[:20000]
+
 
 def get_cookie_client() -> httpx.Client:
     headers = {"Accept": "application/json"}
@@ -265,39 +279,79 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
             c.close()
     return items
 
+def _safe_body_text_from_page_id(page_id: str) -> tuple[str, str, int, str]:
+    """
+    return (body_text, space_key, version, title)
+    1) REST /rest/api/content/{id}?expand=body.storage,version,space 시도
+    2) JSON이 아니거나 실패하면 /plugins/viewstorage/viewpagestorage.action?pageId=... (contentOnly) 폴백
+    모두 실패하면 ("", "", 0, "")
+    """
+    # 1) REST 시도
+    try:
+        client = get_confluence_client()
+        try:
+            url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
+            r = client.get(url, params={"expand": "body.storage,version,space"}, timeout=30)
+        finally:
+            client.close()
+
+        ct = (r.headers.get("content-type") or "").lower()
+        if r.status_code == 401:
+            raise RuntimeError("401")
+        if "application/json" in ct:
+            j = r.json() or {}
+            body_html = ((j.get("body") or {}).get("storage") or {}).get("value", "") or ""
+            title = j.get("title") or ""
+            space_key = ((j.get("space") or {}).get("key")) or ""
+            version = ((j.get("version") or {}).get("number")) or 0
+            if body_html.strip():
+                return _html_to_text(body_html), space_key, version, title
+        # JSON이 아니면 로그인/리다이렉트일 가능성 → 폴백으로
+    except Exception:
+        pass
+
+    # 2) viewstorage 폴백 (쿠키 세션)
+    try:
+        c = get_cookie_client()
+        try:
+            r = c.get(
+                "/plugins/viewstorage/viewpagestorage.action",
+                params={"pageId": page_id, "contentOnly": "true"},
+                headers={"Accept": "text/html"},
+                timeout=30,
+            )
+            if r.status_code == 200 and "text/html" in (r.headers.get("content-type","").lower()):
+                return _html_to_text(r.text), "", 0, ""
+        finally:
+            c.close()
+    except Exception:
+        pass
+
+    return "", "", 0, ""
+
 # --- search: RAG용(본문 포함) --------------------------------
 @app.tool()
 def search(
     query: str,
     top_k: int = 5,
-    limit: t.Optional[int] = None,          # ← rag-proxy가 쓰는 이름도 허용
+    limit: t.Optional[int] = None,
     space: t.Optional[str] = None
 ) -> t.List[dict]:
-    # limit 우선, 없으면 top_k
     k = int(limit) if (isinstance(limit, int) and limit > 0) else int(top_k)
-
     items = _search_pages_impl(query=query, space=space, limit=k) or []
     out: t.List[dict] = []
+
     for it in items:
         pid = it.get("id")
         title = it.get("title") or ""
         url = it.get("url") or ""
-        excerpt = it.get("excerpt") or ""
+        excerpt = (it.get("excerpt") or "").strip()
 
-        body_txt = ""
-        space_key = ""
-        version = 0
-
-        try:
-            page = _get_page_impl(pid)
-            if not title and page.get("title"):
-                title = page["title"]
-            body_html = page.get("body_html") or ""
-            body_txt = _html_to_text(body_html)
-            space_key = page.get("space") or ""
-            version = page.get("version") or 0
-        except Exception:
-            # 본문 조회 실패 시에도 빈 문자열 방지: 발췌/제목으로라도 채움
+        body_txt, space_key, version, title2 = _safe_body_text_from_page_id(pid)
+        if (not title) and title2:
+            title = title2
+        if not body_txt:
+            # 본문이 비면 발췌/제목이라도
             body_txt = excerpt or title or ""
 
         out.append({
@@ -306,11 +360,12 @@ def search(
             "url": url,
             "space": space_key,
             "version": version,
-            "body": body_txt,   # ← rag-proxy가 읽는 키
-            "text": body_txt,   # 호환
+            "body": body_txt,
+            "text": body_txt,
             "excerpt": excerpt,
         })
     return out
+
 
 
 # 간단 HTML 태그 제거
