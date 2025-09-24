@@ -5,6 +5,8 @@ import typing as t
 from urllib.parse import quote_plus
 from mcp.server.fastmcp import FastMCP
 from .html_fallback import search_html
+from mcp.server.sse import run as run_sse
+
 
 # ──────────────────────────────────────────────────────────────
 # 환경변수
@@ -523,4 +525,5 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
     return out
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.getenv("FASTMCP_PORT", "9000"))
+    run_sse(app, host="0.0.0.0", port=port, path="/sse")
