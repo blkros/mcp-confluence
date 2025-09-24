@@ -195,24 +195,29 @@ def tool_search(payload: dict = Body(...)):
         return {"items": []}
     r.raise_for_status()
     # ---- REST 성공 후 (r.raise_for_status() 다음 줄부터 추가)
+    if r.status_code == 400:
+        return {"items": []}
+    r.raise_for_status()
+
     js = r.json() or {}
     results = js.get("results") or []
     items = []
     for res in results:
-        content = (res or {}).get("content") or {}
+        content = (res.get("content") or {})
         if content.get("type") != "page":
             continue
         pid = str(content.get("id") or "")
         if not pid:
             continue
         title = content.get("title") or f"Page {pid}"
-        excerpt = _html_to_text((res or {}).get("excerpt") or "")[:300]
+        excerpt = _html_to_text(res.get("excerpt") or "")[:300]
         items.append({
             "page_id": pid,
             "title": title,
             "url": page_view_url(pid),
             "excerpt": excerpt
         })
+
     return {"items": items}
 
 @api.get("/tool/page_text/{page_id}")

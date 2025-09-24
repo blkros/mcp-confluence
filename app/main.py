@@ -3,7 +3,7 @@
 import os, re, httpx, asyncio
 import typing as t
 from urllib.parse import quote_plus
-from fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP
 from .html_fallback import search_html
 
 # ──────────────────────────────────────────────────────────────
@@ -522,7 +522,6 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
 
     return out
 
-
 if __name__ == "__main__":
-    transport = os.getenv("TRANSPORT", "sse")
-    app.run(transport=transport)
+    port = int(os.getenv("FASTMCP_PORT", "9000"))
+    app.run_sse(host="0.0.0.0", port=port, path="/sse")
