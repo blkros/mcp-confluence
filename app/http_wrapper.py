@@ -15,6 +15,7 @@ BASE_URL = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
 USER = os.environ.get("CONFLUENCE_USER") or ""
 PASSWORD = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
+DEFAULT_SPACE = os.getenv("CONF_DEFAULT_SPACE", "").strip() or None
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
@@ -59,14 +60,18 @@ def _browser_headers() -> dict:
     }
 
 def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[str], limit: int) -> dict:
+    if not space and DEFAULT_SPACE:
+        space = DEFAULT_SPACE  # conf_all 금지, 스페이스 한정
     # 목적지(os_destination)로 로그인 쿠키를 얻기 위해 한 번 더 로그인
     search_path = "/dosearchsite.action"
     params = {"queryString": text, "contentType": "page"}
     if space:
         params["where"] = "conf_space"
         params["spaceKey"] = space
+        os_dest = f"/dosearchsite.action?queryString={quote_plus(text)}&contentType=page&where=conf_space&spaceKey={quote_plus(space)}"
     else:
         params["where"] = "conf_all"
+        os_dest = f"/dosearchsite.action?queryString={quote_plus(text)}&contentType=page&where=conf_all"
 
     # 목적지 포함 로그인
     form = {
@@ -75,9 +80,12 @@ def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[s
         "os_destination": f"{search_path}?queryString={quote_plus(text)}&contentType=page&" + \
                           ("where=conf_space&spaceKey="+quote_plus(space) if space else "where=conf_all")
     }
-    sess.post(f"{BASE_URL}/dologin.action", data=form, allow_redirects=True, headers={"X-Atlassian-Token":"no-check"})
+    sess.post(f"{BASE_URL}/dologin.action",
+              data={"os_username": USER, "os_password": PASSWORD, "os_destination": os_dest},
+              allow_redirects=True, headers={"X-Atlassian-Token": "no-check"})
 
-    r = sess.get(f"{BASE_URL}{search_path}", params=params, headers=_browser_headers(), timeout=30, allow_redirects=True)
+    r = sess.get(f"{BASE_URL}/dosearchsite.action", params=params,
+                 headers=_browser_headers(), timeout=30, allow_redirects=True)
     if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
         return {"items": []}
 
@@ -151,7 +159,7 @@ def tool_search(payload: dict = Body(...)):
     """
     query = (payload or {}).get("query", "")
     limit = int((payload or {}).get("limit", 5) or 5)
-    space = (payload or {}).get("space")
+    space = (payload or {}).get("space") or DEFAULT_SPACE
 
     # 1) 쿼리 정제
     text = _to_cql_text(query)
@@ -186,6 +194,26 @@ def tool_search(payload: dict = Body(...)):
     if r.status_code == 400:
         return {"items": []}
     r.raise_for_status()
+    # ---- REST 성공 후 (r.raise_for_status() 다음 줄부터 추가)
+    js = r.json() or {}
+    results = js.get("results") or []
+    items = []
+    for res in results:
+        content = (res or {}).get("content") or {}
+        if content.get("type") != "page":
+            continue
+        pid = str(content.get("id") or "")
+        if not pid:
+            continue
+        title = content.get("title") or f"Page {pid}"
+        excerpt = _html_to_text((res or {}).get("excerpt") or "")[:300]
+        items.append({
+            "page_id": pid,
+            "title": title,
+            "url": page_view_url(pid),
+            "excerpt": excerpt
+        })
+    return {"items": items}
 
 @api.get("/tool/page_text/{page_id}")
 def tool_page_text(page_id: str):
