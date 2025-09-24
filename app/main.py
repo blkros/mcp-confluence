@@ -3,10 +3,8 @@
 import os, re, httpx, asyncio
 import typing as t
 from urllib.parse import quote_plus
-from mcp.server.fastmcp import FastMCP
 from .html_fallback import search_html
-from mcp.server.sse import run as run_sse
-
+from mcp.server.fastmcp import FastMCP
 
 # ──────────────────────────────────────────────────────────────
 # 환경변수
@@ -36,7 +34,8 @@ def page_view_url(page_id: str) -> str:
 # ──────────────────────────────────────────────────────────────
 # FastMCP 앱
 # ──────────────────────────────────────────────────────────────
-app = FastMCP("Confluence MCP")
+# app = FastMCP("Confluence MCP")
+mcp = FastMCP("Confluence MCP") 
 
 def _keywords(s: str, max_terms: int = 6) -> str:
     toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s or "")
@@ -263,7 +262,7 @@ def _browser_headers() -> dict:
         "Accept-Language": "ko,en;q=0.9",
     }
 
-@app.tool()
+@mcp.tool()
 def get_page(page_id: str) -> dict:
     return _get_page_impl(page_id)
 
@@ -329,7 +328,7 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
     finally:
         c2.close()
 
-@app.tool()
+@mcp.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
     items = _search_pages_impl(query, space, limit) or []
     # excerpt 비면 간단 보강
@@ -404,7 +403,7 @@ def _safe_body_text_from_page_id(page_id: str) -> tuple[str, str, int, str]:
     return "", "", 0, ""
 
 # --- search: RAG용(본문 포함) --------------------------------
-@app.tool()
+@mcp.tool()
 def search(
     query: str,
     top_k: int = 5,
@@ -524,6 +523,11 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
 
     return out
 
+from fastapi import FastAPI
+
+api = FastAPI()
+api.mount("/", mcp.sse_app())
 if __name__ == "__main__":
+    import os, uvicorn
     port = int(os.getenv("FASTMCP_PORT", "9000"))
-    run_sse(app, host="0.0.0.0", port=port, path="/sse")
+    uvicorn.run(api, host="0.0.0.0", port=port)
