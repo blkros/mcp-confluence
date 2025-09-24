@@ -152,7 +152,7 @@ def _get_page_impl(page_id: str) -> dict:
         # 2-1) 본문(storage format)
         r_body = c2.get(
             "/plugins/viewstorage/viewpagestorage.action",
-            params={"pageId": pid},
+            params={"pageId": pid, "contentOnly": "true"},  # ← ← 추가!
             headers={"Accept": "text/html"},
             timeout=30.0,
         )
@@ -270,8 +270,12 @@ def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> 
             for it in items:
                 if not (it.get("excerpt") or "").strip():
                     pid = it.get("id")
-                    r = c.get("/plugins/viewstorage/viewpagestorage.action",
-                              params={"pageId": pid}, headers={"Accept":"text/html"}, timeout=20.0)
+                    r = c.get(
+                        "/plugins/viewstorage/viewpagestorage.action",
+                        params={"pageId": pid, "contentOnly": "true"},
+                        headers={"Accept":"text/html"},
+                        timeout=20.0
+                    )
                     if r.status_code == 200:
                         txt = _html_to_text(r.text)
                         it["excerpt"] = txt[:300]
