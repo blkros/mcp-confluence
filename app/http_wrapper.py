@@ -91,11 +91,19 @@ def tool_search(payload: dict = Body(...)):
         "expand": "space"
     }
     _ensure_authenticated_session(session)
+    s = get_session_for_rest()
     r = session.get(SEARCH_API, params=params, timeout=30)
+    # 1차: Basic으로 시도
+    s = get_session_for_rest()
+    r = s.get(SEARCH_API, params=params, timeout=30)
+
+    # 401/403이면 2차: 쿠키 세션으로 재시도
+    if r.status_code in (401, 403):
+        s = ensure_cookie_session()  # ← 쿠키 로그인
+        r = s.get(SEARCH_API, params=params, timeout=30)
+
     if r.status_code == 400:
         return {"items": []}
-    if r.status_code in (401, 403):
-        raise HTTPException(r.status_code, f"Confluence auth/policy error ({r.status_code})")
     r.raise_for_status()
 
     data = r.json() or {}
@@ -164,3 +172,28 @@ def _ensure_authenticated_session(sess: requests.Session) -> requests.Session:
     if cr.status_code in (401, 403):
         raise HTTPException(cr.status_code, "Confluence auth/policy error (cookie fallback failed)")
     return sess
+
+# --- 세션 헬퍼: Basic 먼저, 401/403이면 폼 로그인으로 쿠키 세션 생성 ---
+def get_session_for_rest() -> requests.Session:
+    # 1) Basic으로 한 번 시도할 세션
+    s = requests.Session()
+    s.verify = VERIFY_SSL
+    s.headers.update({"Accept": "application/json"})
+    if USER and PASSWORD:
+        s.auth = (USER, PASSWORD)
+    return s
+
+def ensure_cookie_session() -> requests.Session:
+    # 2) 폼 로그인(JSESSIONID)으로 쿠키 세션 생성
+    s = requests.Session()
+    s.verify = VERIFY_SSL
+    s.headers.update({"Accept": "application/json"})
+    # Confluence 로그인 폼
+    form = {
+        "os_username": USER,
+        "os_password": PASSWORD,
+        "login": "Log In",
+    }
+    # 리다이렉트 허용으로 쿠키를 세팅
+    s.post(f"{BASE_URL}/dologin.action", data=form, allow_redirects=True, headers={"X-Atlassian-Token": "no-check"})
+    return s
