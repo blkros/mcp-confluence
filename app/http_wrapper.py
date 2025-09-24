@@ -90,6 +90,7 @@ def tool_search(payload: dict = Body(...)):
         "limit": max(1, min(limit, 50)),
         "expand": "space"
     }
+    _ensure_authenticated_session(session)
     r = session.get(SEARCH_API, params=params, timeout=30)
     if r.status_code == 400:
         return {"items": []}
@@ -124,6 +125,7 @@ def tool_page_text(page_id: str):
 
     url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
     params = {"expand": "body.storage,title,version"}
+    _ensure_authenticated_session(session)
     r = session.get(url, params=params, timeout=30)
     if r.status_code in (401, 404):
         raise HTTPException(r.status_code, f"Confluence error ({r.status_code})")
@@ -135,3 +137,30 @@ def tool_page_text(page_id: str):
     text  = _html_to_text(html)
     # 안전상 텍스트 길이 제한
     return {"page_id": page_id, "title": title, "text": text[:200_000]}
+
+# --- 쿠키 로그인 폴백 유틸 ---
+def _ensure_authenticated_session(sess: requests.Session) -> requests.Session:
+    """
+    1) 먼저 REST 가벼운 엔드포인트(예: /rest/api/space?limit=1)로 Basic 시도
+    2) 401/403이면 Basic을 끄고(/dologin.action)로 폼 로그인 → 쿠키 부여
+    3) 쿠키 세션으로 다시 확인
+    """
+    # 1차: Basic으로 가볍게 확인
+    try:
+        r = sess.get(f"{BASE_URL}/rest/api/space", params={"limit": 1}, timeout=10)
+        if r.status_code not in (401, 403):
+            return sess  # Basic 통과
+    except Exception:
+        pass
+
+    # 2차: 폼 로그인 (쿠키 세션으로 전환)
+    sess.auth = None  # Basic 제거
+    form = {"os_username": USER, "os_password": PASSWORD, "os_destination": "/"}
+    sess.headers.update({"X-Atlassian-Token": "no-check"})
+    lr = sess.post(f"{BASE_URL}/dologin.action", data=form, timeout=15, allow_redirects=True)
+
+    # 3차: 쿠키가 실제로 유효한지 재확인
+    cr = sess.get(f"{BASE_URL}/rest/api/space", params={"limit": 1}, timeout=10)
+    if cr.status_code in (401, 403):
+        raise HTTPException(cr.status_code, "Confluence auth/policy error (cookie fallback failed)")
+    return sess
