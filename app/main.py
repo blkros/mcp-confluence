@@ -482,7 +482,11 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
 
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")
+    transport = os.getenv("TRANSPORT", "sse")
     port = int(os.getenv("PORT", "9000"))
-    transport = os.getenv("TRANSPORT", "sse")  # 기본 sse
-    app.run(transport=transport, host=host, port=port)
+
+    try:
+        app.run(transport=transport, port=port)
+    except TypeError:
+        os.environ.setdefault("PORT", str(port))
+        app.run(transport=transport)
