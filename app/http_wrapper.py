@@ -8,6 +8,7 @@ import typing as t
 import requests
 from urllib.parse import quote, quote_plus
 from fastapi import FastAPI, Body, HTTPException
+from requests.utils import quote as _rquote
 
 # --- [ENV] 기존 main.py와 동일 이름 사용 ---
 BASE_URL = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
@@ -48,6 +49,83 @@ def _to_cql_text(q: str) -> str:
     q = _CQL_BAD.sub(" ", q)
     q = re.sub(r"\s+", " ", q).strip()
     return q[:CQL_MAX]
+
+def _browser_headers() -> dict:
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"{BASE_URL}/dashboard.action",
+        "Accept-Language": "ko,en;q=0.9",
+    }
+
+def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[str], limit: int) -> dict:
+    # 목적지(os_destination)로 로그인 쿠키를 얻기 위해 한 번 더 로그인
+    search_path = "/dosearchsite.action"
+    params = {"queryString": text, "contentType": "page"}
+    if space:
+        params["where"] = "conf_space"
+        params["spaceKey"] = space
+    else:
+        params["where"] = "conf_all"
+
+    # 목적지 포함 로그인
+    form = {
+        "os_username": USER,
+        "os_password": PASSWORD,
+        "os_destination": f"{search_path}?queryString={quote_plus(text)}&contentType=page&" + \
+                          ("where=conf_space&spaceKey="+quote_plus(space) if space else "where=conf_all")
+    }
+    sess.post(f"{BASE_URL}/dologin.action", data=form, allow_redirects=True, headers={"X-Atlassian-Token":"no-check"})
+
+    r = sess.get(f"{BASE_URL}{search_path}", params=params, headers=_browser_headers(), timeout=30, allow_redirects=True)
+    if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
+        return {"items": []}
+
+    html = r.text
+    ids = []
+    for pid in re.findall(r'/pages/viewpage\.action\?pageId=(\d+)', html):
+        if pid not in ids:
+            ids.append(pid)
+        if len(ids) >= max(1, min(int(limit or 10), 50)):
+            break
+
+    items = []
+    for pid in ids:
+        # 제목 캐치 (앵커 텍스트 주변)
+        title = ""
+        m = re.search(
+            rf'<a[^>]+href=[\'"][^\'"]*/pages/viewpage\.action\?pageId={pid}[\'"][^>]*>(.*?)</a>',
+            html, flags=re.I | re.S
+        )
+        if m:
+            title = _html_to_text(m.group(1))
+        if not title:
+            # REST로 제목만 보강 (가능하면)
+            rr = sess.get(f"{CONTENT_API}/{quote_plus(pid)}", params={"expand": "version,space"}, timeout=15)
+            if rr.status_code == 200 and "application/json" in (rr.headers.get("content-type","").lower()):
+                try:
+                    title = (rr.json() or {}).get("title") or ""
+                except Exception:
+                    pass
+
+        # 간단 발췌 보강
+        excerpt = ""
+        if m:
+            s = max(0, m.start() - 400)
+            chunk = html[s:m.end()+400]
+            mm = re.search(r'(?:class="[^"]*(?:excerpt|summary)[^"]*">)(.*?)(?:</(?:div|p)>)',
+                           chunk, flags=re.I | re.S)
+            if mm:
+                excerpt = _html_to_text(mm.group(1))[:300]
+
+        items.append({
+            "page_id": str(pid),
+            "title": title or f"Page {pid}",
+            "url": page_view_url(pid),
+            "excerpt": excerpt
+        })
+
+    return {"items": items}
 
 def _html_to_text(html: str) -> str:
     # 아주 라이트한 HTML→텍스트 변환 (필요하면 BeautifulSoup로 교체 가능)
@@ -101,27 +179,13 @@ def tool_search(payload: dict = Body(...)):
         s = ensure_cookie_session()
         r = s.get(SEARCH_API, params=params, timeout=30)
 
+    # 5) 여전히 실패/차단되면 HTML 검색 폴백
+    if r.status_code in (401, 403, 302) or "application/json" not in (r.headers.get("content-type","").lower()):
+        return _html_search_fallback(s, text, space, limit)
+
     if r.status_code == 400:
         return {"items": []}
     r.raise_for_status()
-
-    # 5) 결과 파싱
-    data = r.json() or {}
-    items = []
-    for it in data.get("results") or []:
-        content = (it or {}).get("content") or {}
-        pid   = str(content.get("id") or "")
-        title = content.get("title") or it.get("title") or ""
-        excerpt = (it.get("excerpt") or "").strip()
-        if pid and title:
-            items.append({
-                "page_id": pid,
-                "title": title,
-                "url": page_view_url(pid),
-                "excerpt": excerpt
-            })
-    return {"items": items}
-
 
 @api.get("/tool/page_text/{page_id}")
 def tool_page_text(page_id: str):
@@ -133,7 +197,6 @@ def tool_page_text(page_id: str):
 
     url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
     params = {"expand": "body.storage,title,version"}
-
     # 1) Basic 먼저
     s = get_session_for_rest()
     r = s.get(url, params=params, timeout=30)
@@ -143,15 +206,40 @@ def tool_page_text(page_id: str):
         s = ensure_cookie_session()
         r = s.get(url, params=params, timeout=30)
 
+    # [추가] REST가 404/403/302거나 JSON이 아니면 viewstorage 폴백
+    ct = (r.headers.get("content-type") or "").lower()
+    if r.status_code in (401, 403, 404, 302) or "application/json" not in ct:
+        # 목적지 포함 재로그인
+        vs_path = f"/plugins/viewstorage/viewpagestorage.action?pageId={quote_plus(str(page_id))}&contentOnly=true"
+        s = ensure_cookie_session()
+        s.post(f"{BASE_URL}/dologin.action",
+            data={"os_username": USER, "os_password": PASSWORD, "os_destination": vs_path},
+            allow_redirects=True, headers={"X-Atlassian-Token":"no-check"})
+        rr = s.get(f"{BASE_URL}/plugins/viewstorage/viewpagestorage.action",
+                params={"pageId": page_id, "contentOnly": "true"},
+                headers=_browser_headers(), timeout=30, allow_redirects=True)
+        if rr.status_code == 200 and "text/html" in (rr.headers.get("content-type","").lower()):
+            html = rr.text
+            text = _html_to_text(html)
+            # 제목 보강
+            tr = s.get(f"{BASE_URL}/pages/viewpage.action", params={"pageId": page_id},
+                    headers=_browser_headers(), timeout=15, allow_redirects=True)
+            title = ""
+            if tr.status_code == 200:
+                mm = re.search(r'<meta\s+name="ajs-page-title"\s+content="([^"]*)"', tr.text, re.I)
+                if mm: title = mm.group(1).strip()
+            return {"page_id": page_id, "title": title or f"Page {page_id}", "text": text[:200_000]}
+
+    # 기존 REST 성공 경로
     if r.status_code == 404:
         raise HTTPException(404, "Confluence page not found")
     r.raise_for_status()
-
     js   = r.json() or {}
     title = js.get("title") or ""
     html  = ((js.get("body") or {}).get("storage") or {}).get("value", "")
     text  = _html_to_text(html)
     return {"page_id": page_id, "title": title, "text": text[:200_000]}
+
 
 # --- 쿠키 로그인 폴백 유틸 ---
 def _ensure_authenticated_session(sess: requests.Session) -> requests.Session:
