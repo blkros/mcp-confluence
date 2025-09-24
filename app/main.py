@@ -1,10 +1,11 @@
 # mcp-confluence/main.py
 
-import os, re
+import os, re, httpx, asyncio
 import typing as t
 from urllib.parse import quote_plus
-import httpx
 from fastmcp import FastMCP
+from fastapi import FastAPI
+from .html_fallback import search_html
 
 # ──────────────────────────────────────────────────────────────
 # 환경변수
@@ -13,6 +14,7 @@ BASE_URL    = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
 USER        = os.environ.get("CONFLUENCE_USER") or ""
 PASSWORD    = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL  = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
+TIMEOUT = int(os.getenv("HTTP_TIMEOUT","20"))
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
@@ -35,6 +37,8 @@ def page_view_url(page_id: str) -> str:
 # ──────────────────────────────────────────────────────────────
 app = FastMCP("Confluence MCP")
 
+app = FastAPI()
+
 def _keywords(s: str, max_terms: int = 6) -> str:
     toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s or "")
     toks = [t for t in toks if t.lower() not in _STOP]
@@ -45,6 +49,53 @@ def _to_cql_text(q: str) -> str:
     q = _CQL_BAD.sub(" ", q)
     q = re.sub(r"\s+", " ", q).strip()
     return q[:CQL_MAX]
+
+async def search_rest(query: str, limit: int = 5):
+    auth = (USER, PASS) if USER and PASS else None
+    async with httpx.AsyncClient(base_url=BASE, follow_redirects=True, timeout=TIMEOUT) as client:
+        r = await client.get("/rest/api/search",
+                             params={"cql": f'text~"{query}"', "expand":"content.body.storage","limit":limit},
+                             auth=auth,
+                             headers={"Accept":"application/json","X-Requested-With":"XMLHttpRequest"})
+        if r.status_code != 200:
+            return None  # → 폴백 유도
+        data = r.json()
+        out = []
+        for it in (data.get("results") or [])[:limit]:
+            cont = (it.get("content") or {})
+            title = cont.get("title") or ""
+            page_id = cont.get("id") or ""
+            url = f"{BASE}/pages/viewpage.action?pageId={page_id}" if page_id else BASE
+            # storage가 있으면 텍스트로, 없으면 HTML로 긁어옴
+            storage = (((cont.get("body") or {}).get("storage") or {}).get("value") or "")
+            if storage:
+                from bs4 import BeautifulSoup
+                body = BeautifulSoup(storage, "lxml").get_text("\n", strip=True)
+            else:
+                rp = await client.get(f"/pages/viewpage.action?pageId={page_id}")
+                body = rp.text if rp.status_code == 200 else ""
+                from .html_fallback import _clean_text
+                body = _clean_text(body)
+            if body.strip():
+                out.append({"id": page_id, "space":"", "version":0, "title": title, "url": url, "body": body})
+        return out
+
+# MCP tool: search (REST → HTML fallback)
+@app.post("/tools/search")
+async def tool_search(payload: dict):
+    q = (payload or {}).get("query","")
+    limit = int((payload or {}).get("limit",5))
+    # 1) REST 시도
+    rest = None
+    try:
+        rest = await search_rest(q, limit=limit)
+    except Exception:
+        rest = None
+    if rest:
+        return {"content":[{"type":"json", "json": rest}]}
+    # 2) HTML 세션 폴백
+    html = await search_html(BASE, USER, PASS, q, limit=limit)
+    return {"content":[{"type":"json", "json": html}]}
 
 # ──────────────────────────────────────────────────────────────
 # Basic 먼저 → 401이면 폼 로그인(JSESSIONID) 폴백
