@@ -523,5 +523,4 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
     return out
 
 if __name__ == "__main__":
-    port = int(os.getenv("FASTMCP_PORT", "9000"))
-    app.run_sse(host="0.0.0.0", port=port, path="/sse")
+    app.run()
