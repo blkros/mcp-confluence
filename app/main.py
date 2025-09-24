@@ -49,13 +49,13 @@ def _to_cql_text(q: str) -> str:
 
 async def search_rest(query: str, limit: int = 5):
     auth = (USER, PASSWORD) if USER and PASSWORD else None
-    async with httpx.AsyncClient(base_url=BASE_URL, follow_redirects=True, timeout=TIMEOUT) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, follow_redirects=True, timeout=TIMEOUT, verify=VERIFY_SSL) as client:
         r = await client.get("/rest/api/search",
                              params={"cql": f'text~"{query}"', "expand":"content.body.storage","limit":limit},
                              auth=auth,
                              headers={"Accept":"application/json","X-Requested-With":"XMLHttpRequest"})
         if r.status_code != 200:
-            return None  # → 폴백 유도
+            return None
         data = r.json()
         out = []
         for it in (data.get("results") or [])[:limit]:
@@ -137,16 +137,41 @@ def _html_to_text(html: str) -> str:
     return s.strip()[:20000]
 
 
-def get_cookie_client() -> httpx.Client:
+# [추가] 브라우저 흉내 헤더 유틸 (302 로그인 튕김 줄이는 데 도움)
+def _browser_headers() -> dict:
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"{BASE_URL}/dashboard.action",
+        "Accept-Language": "ko,en;q=0.9",
+    }
+
+def get_cookie_client(destination: t.Optional[str] = None) -> httpx.Client:
+    """
+    목적지(os_destination) 페이지로 바로 리다이렉트되도록 로그인 쿠키를 받는다.
+    permissionViolation(302 → /login.action) 완화 목적.
+    """
     headers = {"Accept": "application/json"}
-    c = httpx.Client(base_url=BASE_URL, headers=headers, verify=VERIFY_SSL, timeout=30.0, follow_redirects=True)
-    form = {"os_username": USER, "os_password": PASSWORD, "os_destination": "/"}
+    c = httpx.Client(
+        base_url=BASE_URL,
+        headers=headers,
+        verify=VERIFY_SSL,
+        timeout=30.0,
+        follow_redirects=True,
+    )
+    form = {
+        "os_username": USER,
+        "os_password": PASSWORD,
+        "os_destination": (destination or "/"),
+    }
     c.post("/dologin.action", data=form, headers={"X-Atlassian-Token": "no-check"})
+    # 로그인 유효성 가볍게 확인
     cr = c.get("/rest/api/space?limit=1")
     if cr.status_code == 401:
         c.close()
         raise RuntimeError("Confluence cookie auth failed. Check policy/SSO.")
     return c
+
 
 # --- get_page: impl + tool wrapper ---------------------------
 def _get_page_impl(page_id: str) -> dict:
@@ -178,24 +203,27 @@ def _get_page_impl(page_id: str) -> dict:
         c.close()
 
     # 2) HTML 폴백: viewstorage(본문) + viewpage(메타)
-    c2 = get_cookie_client()
+    # [변경] 목적지(path)를 만든 뒤, 그 목적지로 로그인해서 쿠키 세션 획득
+    viewstorage_path = f"/plugins/viewstorage/viewpagestorage.action?pageId={pid}&contentOnly=true"
+    c2 = get_cookie_client(destination=viewstorage_path)   # ← 핵심
     try:
-        # 2-1) 본문(storage format)
+        # 본문(storage format)
         r_body = c2.get(
             "/plugins/viewstorage/viewpagestorage.action",
-            params={"pageId": pid, "contentOnly": "true"},  # ← ← 추가!
-            headers={"Accept": "text/html"},
+            params={"pageId": pid, "contentOnly": "true"},
+            headers=_browser_headers(),   # ← 브라우저 흉내 헤더
             timeout=30.0,
         )
         body_html = r_body.text if r_body.status_code == 200 else ""
 
-        # 2-2) 제목/스페이스/버전 (viewpage meta 태그 파싱)
+        # 제목/스페이스/버전
         r_meta = c2.get(
             "/pages/viewpage.action",
             params={"pageId": pid},
-            headers={"Accept": "text/html"},
+            headers=_browser_headers(),
             timeout=30.0,
         )
+
         title = ""
         space_key = ""
         version = 0
@@ -224,6 +252,14 @@ def _get_page_impl(page_id: str) -> dict:
         }
     finally:
         c2.close()
+
+def _browser_headers() -> dict:
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+        "Referer": f"{BASE_URL}/dashboard.action",
+        "Accept-Language": "ko,en;q=0.9",
+    }
 
 @app.tool()
 def get_page(page_id: str) -> dict:
@@ -347,12 +383,13 @@ def _safe_body_text_from_page_id(page_id: str) -> tuple[str, str, int, str]:
 
     # 2) viewstorage 폴백 (쿠키 세션)
     try:
-        c = get_cookie_client()
+        viewstorage_path = f"/plugins/viewstorage/viewpagestorage.action?pageId={page_id}&contentOnly=true"
+        c = get_cookie_client(destination=viewstorage_path)
         try:
             r = c.get(
                 "/plugins/viewstorage/viewpagestorage.action",
                 params={"pageId": page_id, "contentOnly": "true"},
-                headers={"Accept": "text/html"},
+                headers=_browser_headers(),
                 timeout=30,
             )
             if r.status_code == 200 and "text/html" in (r.headers.get("content-type","").lower()):
@@ -420,10 +457,15 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
     else:
         params["where"] = "conf_all"
 
-    r = client.get(
-        "/dosearchsite.action",
+    # 검색 경로 + 쿼리스트링을 os_destination 으로 주고 재로그인
+    search_path = "/dosearchsite.action"
+    from httpx import QueryParams
+    destination = f"{search_path}?{str(QueryParams(params))}"
+    c = get_cookie_client(destination=destination)
+    r = c.get(
+        search_path,
         params=params,
-        headers={"Accept": "text/html"},
+        headers=_browser_headers(),
         timeout=30.0,
     )
     if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
@@ -483,10 +525,4 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
 
 if __name__ == "__main__":
     transport = os.getenv("TRANSPORT", "sse")
-    port = int(os.getenv("PORT", "9000"))
-
-    try:
-        app.run(transport=transport, port=port)
-    except TypeError:
-        os.environ.setdefault("PORT", str(port))
-        app.run(transport=transport)
+    app.run(transport=transport)
