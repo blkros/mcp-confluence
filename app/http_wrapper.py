@@ -65,7 +65,6 @@ def _html_to_text(html: str) -> str:
 # --- [FASTAPI APP] ---
 api = FastAPI(title="Confluence HTTP Wrapper", version="1.0.0")
 
-# --- [ENDPOINT] /tool/search : CQL 검색 ---
 @api.post("/tool/search")
 def tool_search(payload: dict = Body(...)):
     """
@@ -76,10 +75,12 @@ def tool_search(payload: dict = Body(...)):
     limit = int((payload or {}).get("limit", 5) or 5)
     space = (payload or {}).get("space")
 
+    # 1) 쿼리 정제
     text = _to_cql_text(query)
     if not text:
         return {"items": []}
 
+    # 2) CQL 구성
     parts = ['type=page', f'text ~ "{text}"']
     if space:
         parts.append(f"space={space}")
@@ -88,24 +89,23 @@ def tool_search(payload: dict = Body(...)):
     params = {
         "cql": cql,
         "limit": max(1, min(limit, 50)),
-        "expand": "space"
+        "expand": "space",
     }
-    _ensure_authenticated_session(session)
-    s = get_session_for_rest()
-    r = session.get(SEARCH_API, params=params, timeout=30)
-    # 1차: Basic으로 시도
+
+    # 3) Basic 먼저 시도
     s = get_session_for_rest()
     r = s.get(SEARCH_API, params=params, timeout=30)
 
-    # 401/403이면 2차: 쿠키 세션으로 재시도
+    # 4) 401/403이면 쿠키 로그인 폴백
     if r.status_code in (401, 403):
-        s = ensure_cookie_session()  # ← 쿠키 로그인
+        s = ensure_cookie_session()
         r = s.get(SEARCH_API, params=params, timeout=30)
 
     if r.status_code == 400:
         return {"items": []}
     r.raise_for_status()
 
+    # 5) 결과 파싱
     data = r.json() or {}
     items = []
     for it in data.get("results") or []:
@@ -122,7 +122,7 @@ def tool_search(payload: dict = Body(...)):
             })
     return {"items": items}
 
-# --- [ENDPOINT] /tool/page_text/{page_id} : 본문(storage HTML→텍스트) ---
+
 @api.get("/tool/page_text/{page_id}")
 def tool_page_text(page_id: str):
     """
@@ -133,17 +133,24 @@ def tool_page_text(page_id: str):
 
     url = f"{CONTENT_API}/{quote_plus(str(page_id))}"
     params = {"expand": "body.storage,title,version"}
-    _ensure_authenticated_session(session)
-    r = session.get(url, params=params, timeout=30)
-    if r.status_code in (401, 404):
-        raise HTTPException(r.status_code, f"Confluence error ({r.status_code})")
+
+    # 1) Basic 먼저
+    s = get_session_for_rest()
+    r = s.get(url, params=params, timeout=30)
+
+    # 2) 401/403이면 쿠키 로그인 폴백
+    if r.status_code in (401, 403):
+        s = ensure_cookie_session()
+        r = s.get(url, params=params, timeout=30)
+
+    if r.status_code == 404:
+        raise HTTPException(404, "Confluence page not found")
     r.raise_for_status()
 
     js   = r.json() or {}
     title = js.get("title") or ""
     html  = ((js.get("body") or {}).get("storage") or {}).get("value", "")
     text  = _html_to_text(html)
-    # 안전상 텍스트 길이 제한
     return {"page_id": page_id, "title": title, "text": text[:200_000]}
 
 # --- 쿠키 로그인 폴백 유틸 ---
@@ -184,16 +191,19 @@ def get_session_for_rest() -> requests.Session:
     return s
 
 def ensure_cookie_session() -> requests.Session:
-    # 2) 폼 로그인(JSESSIONID)으로 쿠키 세션 생성
+    """폼 로그인(JSESSIONID)으로 쿠키 세션 생성"""
     s = requests.Session()
     s.verify = VERIFY_SSL
     s.headers.update({"Accept": "application/json"})
-    # Confluence 로그인 폼
+
     form = {
         "os_username": USER,
         "os_password": PASSWORD,
-        "login": "Log In",
+        "os_destination": "/",   # 로그인 후 리다이렉트 목적지
+        "login": "Log In",       # 일부 테마/버전에서 필요
     }
-    # 리다이렉트 허용으로 쿠키를 세팅
-    s.post(f"{BASE_URL}/dologin.action", data=form, allow_redirects=True, headers={"X-Atlassian-Token": "no-check"})
+    s.post(f"{BASE_URL}/dologin.action",
+           data=form,
+           allow_redirects=True,
+           headers={"X-Atlassian-Token": "no-check"})
     return s
