@@ -40,6 +40,12 @@ _STOP = {"task","guidelines","output","chat","history","assistant","user",
 _CQL_BAD  = re.compile(r'["\n\r\t]+')
 CQL_MAX   = 120
 
+DEBUG = (os.getenv("CONF_DEBUG") or "false").lower() in ("1","true","yes")
+
+def dbg(*a):
+    if DEBUG:
+        print("[http_wrapper]", *a, flush=True)
+
 def _keywords(s: str, max_terms: int = 6) -> str:
     toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s or "")
     toks = [t for t in toks if t.lower() not in _STOP]
@@ -60,6 +66,7 @@ def _browser_headers() -> dict:
     }
 
 def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[str], limit: int) -> dict:
+    dbg("HTML_FALLBACK: start text=", text, "space=", space, "limit=", limit)    
     if not space and DEFAULT_SPACE:
         space = DEFAULT_SPACE  # conf_all 금지, 스페이스 한정
     # 목적지(os_destination)로 로그인 쿠키를 얻기 위해 한 번 더 로그인
@@ -86,7 +93,9 @@ def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[s
 
     r = sess.get(f"{BASE_URL}/dosearchsite.action", params=params,
                  headers=_browser_headers(), timeout=30, allow_redirects=True)
+    dbg("HTML_FALLBACK: /dosearchsite.action ->", r.status_code, r.headers.get("content-type"))
     if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
+        dbg("HTML_FALLBACK: non-200 or non-html -> []")
         return {"items": []}
 
     html = r.text
@@ -96,7 +105,8 @@ def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[s
             ids.append(pid)
         if len(ids) >= max(1, min(int(limit or 10), 50)):
             break
-
+    dbg("HTML_FALLBACK: found pageIds:", ids[:10], "(total", len(ids), ")")
+    
     items = []
     for pid in ids:
         # 제목 캐치 (앵커 텍스트 주변)
@@ -132,7 +142,7 @@ def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[s
             "url": page_view_url(pid),
             "excerpt": excerpt
         })
-
+    dbg("HTML_FALLBACK: items:", len(items))
     return {"items": items}
 
 def _html_to_text(html: str) -> str:
@@ -161,9 +171,12 @@ def tool_search(payload: dict = Body(...)):
     limit = int((payload or {}).get("limit", 5) or 5)
     space = (payload or {}).get("space") or DEFAULT_SPACE
 
+    dbg("SEARCH: query=", query, "space=", space, "limit=", limit)
+
     # 1) 쿼리 정제
     text = _to_cql_text(query)
     if not text:
+        dbg("SEARCH: empty after _to_cql_text -> return []")
         return {"items": []}
 
     # 2) CQL 구성
@@ -171,6 +184,9 @@ def tool_search(payload: dict = Body(...)):
     if space:
         parts.append(f"space={space}")
     cql = " AND ".join(parts)
+
+    # [DEBUG] CQL 찍기
+    dbg("CQL:", cql)
 
     params = {
         "cql": cql,
@@ -184,21 +200,28 @@ def tool_search(payload: dict = Body(...)):
         r = s.get(SEARCH_API, params=params, timeout=30)
         ct = (r.headers.get("content-type") or "").lower()
 
+        # [DEBUG] 1차 REST 호출 결과
+        dbg("REST /search ->", r.status_code, ct, r.url)
+
         if r.status_code in (401, 403):
+            dbg("REST 401/403 -> cookie login fallback")
             s = ensure_cookie_session()
             r = s.get(SEARCH_API, params=params, timeout=30)
             ct = (r.headers.get("content-type") or "").lower()
+            dbg("REST(retry-cookie) /search ->", r.status_code, ct, r.url)
 
         if (not r.ok) or ("application/json" not in ct):
+            dbg("FALLBACK: HTML dosearchsite.action (space=", space, ")")
             return _html_search_fallback(s, text, space, limit)
 
         js = r.json() or {}
-    except Exception:
-        # REST 경로에서 어떤 예외가 나도 200 + 빈 결과 or HTML 폴백
+    except Exception as e:
+        dbg("REST path exception:", repr(e), "-> try HTML fallback")
         try:
             s = ensure_cookie_session()
             return _html_search_fallback(s, text, space, limit)
-        except Exception:
+        except Exception as e2:
+            dbg("HTML fallback exception:", repr(e2))
             return {"items": []}
 
     results = js.get("results") or []
@@ -213,7 +236,7 @@ def tool_search(payload: dict = Body(...)):
         title = content.get("title") or f"Page {pid}"
         excerpt = _html_to_text(res.get("excerpt") or "")[:300]
         items.append({"page_id": pid, "title": title, "url": page_view_url(pid), "excerpt": excerpt})
-
+    dbg("SEARCH: REST items:", len(items))
     return {"items": items}
 
 @api.get("/tool/page_text/{page_id}")
@@ -230,14 +253,23 @@ def tool_page_text(page_id: str):
     s = get_session_for_rest()
     r = s.get(url, params=params, timeout=30)
 
-    # 2) 401/403이면 쿠키 로그인 폴백
+    # 먼저 ct 계산 + 1차 로그
+    ct = (r.headers.get("content-type") or "").lower()
+    dbg("PAGE_TEXT: REST ->", r.status_code, ct, url)
+
+    # 401/403이면 쿠키 폴백
     if r.status_code in (401, 403):
+        dbg("PAGE_TEXT: 401/403 -> cookie fallback")
         s = ensure_cookie_session()
         r = s.get(url, params=params, timeout=30)
+        ct = (r.headers.get("content-type") or "").lower()
+        dbg("PAGE_TEXT: REST(retry-cookie) ->", r.status_code, ct, url)
 
     # [추가] REST가 404/403/302거나 JSON이 아니면 viewstorage 폴백
     ct = (r.headers.get("content-type") or "").lower()
+    dbg("PAGE_TEXT: REST ->", r.status_code, ct, url)
     if r.status_code in (401, 403, 404, 302) or "application/json" not in ct:
+        dbg("PAGE_TEXT: viewstorage fallback pageId=", page_id)
         # 목적지 포함 재로그인
         vs_path = f"/plugins/viewstorage/viewpagestorage.action?pageId={quote_plus(str(page_id))}&contentOnly=true"
         s = ensure_cookie_session()
@@ -247,6 +279,7 @@ def tool_page_text(page_id: str):
         rr = s.get(f"{BASE_URL}/plugins/viewstorage/viewpagestorage.action",
                 params={"pageId": page_id, "contentOnly": "true"},
                 headers=_browser_headers(), timeout=30, allow_redirects=True)
+        dbg("PAGE_TEXT: viewstorage ->", rr.status_code, rr.headers.get("content-type"))
         if rr.status_code == 200 and "text/html" in (rr.headers.get("content-type","").lower()):
             html = rr.text
             text = _html_to_text(html)
@@ -257,16 +290,19 @@ def tool_page_text(page_id: str):
             if tr.status_code == 200:
                 mm = re.search(r'<meta\s+name="ajs-page-title"\s+content="([^"]*)"', tr.text, re.I)
                 if mm: title = mm.group(1).strip()
+            dbg("PAGE_TEXT: viewstorage ok. title(len)=", len(title), "text(len)=", len(text))
             return {"page_id": page_id, "title": title or f"Page {page_id}", "text": text[:200_000]}
 
     # 기존 REST 성공 경로
     if r.status_code == 404:
+        dbg("PAGE_TEXT: REST 404 final")
         raise HTTPException(404, "Confluence page not found")
     r.raise_for_status()
     js   = r.json() or {}
     title = js.get("title") or ""
     html  = ((js.get("body") or {}).get("storage") or {}).get("value", "")
     text  = _html_to_text(html)
+    dbg("PAGE_TEXT: REST ok. title(len)=", len(title), "text(len)=", len(text))
     return {"page_id": page_id, "title": title, "text": text[:200_000]}
 
 
@@ -309,6 +345,7 @@ def get_session_for_rest() -> requests.Session:
 
 def ensure_cookie_session() -> requests.Session:
     """폼 로그인(JSESSIONID)으로 쿠키 세션 생성"""
+    dbg("AUTH: ensure_cookie_session()")
     s = requests.Session()
     s.verify = VERIFY_SSL
     s.headers.update({"Accept": "application/json"})
@@ -323,4 +360,5 @@ def ensure_cookie_session() -> requests.Session:
            data=form,
            allow_redirects=True,
            headers={"X-Atlassian-Token": "no-check"})
+    dbg("AUTH: cookie session ready")
     return s

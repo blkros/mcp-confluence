@@ -67,6 +67,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
     k  = req.top_k or TOP_K
     th = req.threshold if req.threshold is not None else THRESH
     q  = (req.query or "").strip()
+    print("[mcp] Q=", q, "k=", k, "th=", th, flush=True)
 
     # 절대 4xx/5xx 내보내지 않음
     if not q:
@@ -85,7 +86,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
             items = qres.get("items") or qres.get("hits") or []
 
         top_score = float(qres.get("top_score") or _best_score(items))
-
+        print("[mcp] first top_score=", top_score, "items=", len(items), flush=True)
         used_fallback = False
 
         # 2) 스코어가 임계치 미달이면 MCP로 보강
@@ -100,7 +101,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
                     await asyncio.sleep(0.6 * (i + 1))
             if not isinstance(found, list):
                 found = []
-
+            print("[mcp] found (search) =", len(found), flush=True)
             # 2-2) 본문 수집 (간단 재시도)
             new_docs = []
             for it in found:
@@ -130,7 +131,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
                         "url": it.get("url") or "",
                     }
                 })
-
+            print("[mcp] new_docs to upsert =", len(new_docs), flush=True)
             # 2-3) 업서트 & 재조회 (실패해도 무시)
             if new_docs:
                 try:
