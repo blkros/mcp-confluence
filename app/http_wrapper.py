@@ -178,28 +178,29 @@ def tool_search(payload: dict = Body(...)):
         "expand": "space",
     }
 
-    # 3) Basic 먼저 시도
-    s = get_session_for_rest()
-    r = s.get(SEARCH_API, params=params, timeout=30)
-
-    # 4) 401/403이면 쿠키 로그인 폴백
-    if r.status_code in (401, 403):
-        s = ensure_cookie_session()
+    # --- REST 시도 + 쿠키 폴백, 실패/비-JSON이면 HTML 폴백 ---
+    try:
+        s = get_session_for_rest()
         r = s.get(SEARCH_API, params=params, timeout=30)
+        ct = (r.headers.get("content-type") or "").lower()
 
-    # 5) 여전히 실패/차단되면 HTML 검색 폴백
-    if r.status_code in (401, 403, 302) or "application/json" not in (r.headers.get("content-type","").lower()):
-        return _html_search_fallback(s, text, space, limit)
+        if r.status_code in (401, 403):
+            s = ensure_cookie_session()
+            r = s.get(SEARCH_API, params=params, timeout=30)
+            ct = (r.headers.get("content-type") or "").lower()
 
-    if r.status_code == 400:
-        return {"items": []}
-    r.raise_for_status()
-    # ---- REST 성공 후 (r.raise_for_status() 다음 줄부터 추가)
-    if r.status_code == 400:
-        return {"items": []}
-    r.raise_for_status()
+        if (not r.ok) or ("application/json" not in ct):
+            return _html_search_fallback(s, text, space, limit)
 
-    js = r.json() or {}
+        js = r.json() or {}
+    except Exception:
+        # REST 경로에서 어떤 예외가 나도 200 + 빈 결과 or HTML 폴백
+        try:
+            s = ensure_cookie_session()
+            return _html_search_fallback(s, text, space, limit)
+        except Exception:
+            return {"items": []}
+
     results = js.get("results") or []
     items = []
     for res in results:
@@ -211,12 +212,7 @@ def tool_search(payload: dict = Body(...)):
             continue
         title = content.get("title") or f"Page {pid}"
         excerpt = _html_to_text(res.get("excerpt") or "")[:300]
-        items.append({
-            "page_id": pid,
-            "title": title,
-            "url": page_view_url(pid),
-            "excerpt": excerpt
-        })
+        items.append({"page_id": pid, "title": title, "url": page_view_url(pid), "excerpt": excerpt})
 
     return {"items": items}
 

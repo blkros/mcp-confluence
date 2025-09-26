@@ -3,10 +3,11 @@
 #       1) RAG 1차 조회 -> 스코어 낮으면
 #       2) MCP(Confluence HTTP wrapper) 검색/본문 수집 -> RAG 업서트 -> 재조회
 
-import os, requests
+import os, requests, asyncio
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
@@ -56,72 +57,115 @@ class SearchAndIngestReq(BaseModel):
     max_pages: Optional[int] = None  # MCP에서 최대 가져올 페이지 수
 
 @app.post("/search_and_ingest_mcp")
-def search_and_ingest(req: SearchAndIngestReq):
-    k  = req.top_k or TOP_K
-    th = req.threshold if req.threshold is not None else THRESH
-    q  = (req.query or "").strip()
-    if not q:
-        raise HTTPException(400, "query is empty")
-
-    # 1) 1차 조회
-    qres = rag_query(q, k)
-
-    # rag-proxy 응답 호환: items(list), hits(int)
-    items = []
-    if isinstance(qres, dict):
-        if isinstance(qres.get("items"), list):
-            items = qres["items"]
-        elif isinstance(qres.get("hits"), list):  # 구버전 호환
-            items = qres["hits"]
-
+async def search_and_ingest(req: SearchAndIngestReq):
     def _best_score(xs):
         try:
             return max(float(x.get("score") or 0.0) for x in xs) if xs else 0.0
         except Exception:
             return 0.0
 
-    top_score = float(qres.get("top_score") or _best_score(items))
+    k  = req.top_k or TOP_K
+    th = req.threshold if req.threshold is not None else THRESH
+    q  = (req.query or "").strip()
 
-    used_fallback = False
-    if top_score < th:
-        # 2) MCP 검색 → 본문 수집 → 업서트
-        found = mcp_conf_search(q, limit=req.max_pages or k)
-        new_docs: List[Dict[str, Any]] = []
-        for it in found:
-            pid = it.get("page_id")
-            if not pid:
-                continue
-            page = mcp_conf_page_text(pid)
-            text  = (page.get("text") or "").strip()
-            title = page.get("title") or it.get("title") or ""
-            if not text:
-                continue
-            new_docs.append({
-                "id": f"confluence:{pid}",
-                "text": text[:200_000],
-                "metadata": {
-                    "source": "confluence",
-                    "title": title,
-                    "url": it.get("url") or "",
-                }
-            })
-        if new_docs:
-            rag_upsert_docs(new_docs)
-            used_fallback = True
-            # 3) 재조회
-            qres = rag_query(q, k)
-            items = qres.get("items") or []
-            top_score = float(qres.get("top_score") or _best_score(items))
+    # 절대 4xx/5xx 내보내지 않음
+    if not q:
+        return {"used_fallback": None, "top_score": 0.0, "hits": [], "error": "query is empty"}
 
-    # 4) 스니펫 반환 (items 기준으로 생성)
-    return {
-        "used_fallback": used_fallback,
-        "top_score": top_score,
-        "hits": [
-            {
-                "chunk": (h.get("text") or "")[:1200],
-                "score": float(h.get("score") or 0.0),
-                "meta":  h.get("metadata") or {}
-            } for h in (items or [])
-        ]
-    }
+    try:
+        # 1) 1차 RAG 조회
+        try:
+            qres = rag_query(q, k) or {}
+        except Exception as e:
+            qres = {}
+
+        items = []
+        if isinstance(qres, dict):
+            # rag-proxy 응답 호환: items(list) 또는 hits(list)
+            items = qres.get("items") or qres.get("hits") or []
+
+        top_score = float(qres.get("top_score") or _best_score(items))
+
+        used_fallback = False
+
+        # 2) 스코어가 임계치 미달이면 MCP로 보강
+        if top_score < th:
+            # 2-1) 검색 (간단 재시도)
+            found = []
+            for i in range(3):
+                try:
+                    found = mcp_conf_search(q, limit=(req.max_pages or k)) or []
+                    break
+                except Exception:
+                    await asyncio.sleep(0.6 * (i + 1))
+            if not isinstance(found, list):
+                found = []
+
+            # 2-2) 본문 수집 (간단 재시도)
+            new_docs = []
+            for it in found:
+                pid = str(it.get("page_id") or it.get("id") or "").strip()
+                if not pid:
+                    continue
+
+                page = {}
+                for i in range(2):
+                    try:
+                        page = mcp_conf_page_text(pid) or {}
+                        break
+                    except Exception:
+                        await asyncio.sleep(0.5 * (i + 1))
+
+                text  = (page.get("text") or "").strip()
+                title = (page.get("title") or it.get("title") or "").strip()
+                if not text:
+                    continue
+
+                new_docs.append({
+                    "id": f"confluence:{pid}",
+                    "text": text[:200_000],
+                    "metadata": {
+                        "source": "confluence",
+                        "title": title,
+                        "url": it.get("url") or "",
+                    }
+                })
+
+            # 2-3) 업서트 & 재조회 (실패해도 무시)
+            if new_docs:
+                try:
+                    rag_upsert_docs(new_docs)
+                except Exception:
+                    pass
+
+                used_fallback = True
+
+                try:
+                    qres2 = rag_query(q, k) or {}
+                    items = (qres2.get("items") or qres2.get("hits") or []) if isinstance(qres2, dict) else []
+                    top_score = float(qres2.get("top_score") or _best_score(items))
+                except Exception:
+                    # 재조회 실패해도 200으로 종료
+                    pass
+
+        # 3) 최종 스니펫 반환 (항상 200)
+        return {
+            "used_fallback": used_fallback,
+            "top_score": float(top_score or 0.0),
+            "hits": [
+                {
+                    "chunk": (h.get("text") or h.get("chunk") or "")[:1200],
+                    "score": float(h.get("score") or 0.0),
+                    "meta":  (h.get("metadata") or h.get("meta") or {})
+                } for h in (items or [])
+            ]
+        }
+
+    except Exception as e:
+        # 어떤 예외도 500으로 올리지 말고 200 + 빈 결과로 마무리
+        return {
+            "used_fallback": None,
+            "top_score": 0.0,
+            "hits": [],
+            "error": str(e)
+        }
