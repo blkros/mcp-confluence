@@ -3,7 +3,7 @@
 #      → 브릿지(bridge_mcp.py)에서 이걸 호출해서 검색/본문을 받아간다.
 
 # --- [IMPORTS] ---
-import os, re
+import os, re, time
 import typing as t
 import requests
 from urllib.parse import quote, quote_plus
@@ -57,6 +57,22 @@ def _to_cql_text(q: str) -> str:
     q = re.sub(r"\s+", " ", q).strip()
     return q[:CQL_MAX]
 
+def _to_cql_tokens(q: str, min_len: int = 2, max_tokens: int = 6):
+    q = (q or "").strip()
+    q = re.sub(r'["“”\'’]', ' ', q)
+    toks = re.split(r'[\s\W]+', q)
+    seen, out = set(), []
+    for t in toks:
+        t = t.strip()
+        if len(t) >= min_len:
+            key = t.lower()
+            if key not in seen:
+                out.append(t)
+                seen.add(key)
+            if len(out) >= max_tokens:
+                break
+    return out
+
 def _browser_headers() -> dict:
     return {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -65,85 +81,91 @@ def _browser_headers() -> dict:
         "Accept-Language": "ko,en;q=0.9",
     }
 
+def _looks_like_login(html: str) -> bool:
+    if not html: return False
+    return bool(re.search(r'login|log-in|username|password', html, re.I))
+
 def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[str], limit: int) -> dict:
     dbg("HTML_FALLBACK: start text=", text, "space=", space, "limit=", limit)    
-    if not space and DEFAULT_SPACE:
-        space = DEFAULT_SPACE  # conf_all 금지, 스페이스 한정
+    # if not space and DEFAULT_SPACE:
+    #     space = DEFAULT_SPACE
+
     # 목적지(os_destination)로 로그인 쿠키를 얻기 위해 한 번 더 로그인
     search_path = "/dosearchsite.action"
     params = {"queryString": text, "contentType": "page"}
     if space:
-        params["where"] = "conf_space"
-        params["spaceKey"] = space
+        params.update({"where": "conf_space", "spaceKey": space})
         os_dest = f"/dosearchsite.action?queryString={quote_plus(text)}&contentType=page&where=conf_space&spaceKey={quote_plus(space)}"
     else:
-        params["where"] = "conf_all"
+        params.update({"where": "conf_all"})
         os_dest = f"/dosearchsite.action?queryString={quote_plus(text)}&contentType=page&where=conf_all"
 
     # 목적지 포함 로그인
-    form = {
-        "os_username": USER,
-        "os_password": PASSWORD,
-        "os_destination": f"{search_path}?queryString={quote_plus(text)}&contentType=page&" + \
-                          ("where=conf_space&spaceKey="+quote_plus(space) if space else "where=conf_all")
-    }
     sess.post(f"{BASE_URL}/dologin.action",
               data={"os_username": USER, "os_password": PASSWORD, "os_destination": os_dest},
               allow_redirects=True, headers={"X-Atlassian-Token": "no-check"})
 
-    r = sess.get(f"{BASE_URL}/dosearchsite.action", params=params,
-                 headers=_browser_headers(), timeout=30, allow_redirects=True)
-    dbg("HTML_FALLBACK: /dosearchsite.action ->", r.status_code, r.headers.get("content-type"))
-    if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
-        dbg("HTML_FALLBACK: non-200 or non-html -> []")
-        return {"items": []}
+    last_r = None
+    for i in range(3):
+        r = sess.get(f"{BASE_URL}/dosearchsite.action", params=params,
+                     headers=_browser_headers(), timeout=30, allow_redirects=True)
+        last_r = r
+        dbg("HTML_FALLBACK: /dosearchsite.action ->", r.status_code, r.headers.get("content-type"))
 
-    html = r.text
-    ids = []
-    for pid in re.findall(r'/pages/viewpage\.action\?pageId=(\d+)', html):
-        if pid not in ids:
-            ids.append(pid)
-        if len(ids) >= max(1, min(int(limit or 10), 50)):
-            break
-    dbg("HTML_FALLBACK: found pageIds:", ids[:10], "(total", len(ids), ")")
+        if r.status_code == 200 and "text/html" in (r.headers.get("content-type") or "").lower():
+            html = r.text or ""
+            # 로그인 페이지 감지 시 재로그인 후 재시도
+            if _looks_like_login(html):
+                dbg("HTML_FALLBACK: looks like login page -> re-login and retry")
+                sess = ensure_cookie_session()
+                time.sleep(0.4 * (i + 1))
+                continue
+            ids = []
+            for pid in re.findall(r'/pages/viewpage\.action\?pageId=(\d+)', html):
+                if pid not in ids:
+                    ids.append(pid)
+                if len(ids) >= max(1, min(int(limit or 10), 50)):
+                    break
+            dbg("HTML_FALLBACK: found pageIds:", ids[:10], "(total", len(ids), ")")
     
-    items = []
-    for pid in ids:
-        # 제목 캐치 (앵커 텍스트 주변)
-        title = ""
-        m = re.search(
-            rf'<a[^>]+href=[\'"][^\'"]*/pages/viewpage\.action\?pageId={pid}[\'"][^>]*>(.*?)</a>',
-            html, flags=re.I | re.S
-        )
-        if m:
-            title = _html_to_text(m.group(1))
-        if not title:
-            # REST로 제목만 보강 (가능하면)
-            rr = sess.get(f"{CONTENT_API}/{quote_plus(pid)}", params={"expand": "version,space"}, timeout=15)
-            if rr.status_code == 200 and "application/json" in (rr.headers.get("content-type","").lower()):
-                try:
-                    title = (rr.json() or {}).get("title") or ""
-                except Exception:
-                    pass
+            items = []
+            for pid in ids:
+                title = ""
+                m = re.search(
+                    rf'<a[^>]+href=[\'"][^\'"]*/pages/viewpage\.action\?pageId={pid}[\'"][^>]*>(.*?)</a>',
+                    html, flags=re.I | re.S
+                )
+                if m:
+                    title = _html_to_text(m.group(1))
+                if not title:
+                    rr = sess.get(f"{CONTENT_API}/{quote_plus(pid)}",
+                                  params={"expand": "version,space"}, timeout=15)
+                    if rr.status_code == 200 and "application/json" in (rr.headers.get("content-type","").lower()):
+                        try:
+                            title = (rr.json() or {}).get("title") or ""
+                        except Exception:
+                            pass
 
-        # 간단 발췌 보강
-        excerpt = ""
-        if m:
-            s = max(0, m.start() - 400)
-            chunk = html[s:m.end()+400]
-            mm = re.search(r'(?:class="[^"]*(?:excerpt|summary)[^"]*">)(.*?)(?:</(?:div|p)>)',
-                           chunk, flags=re.I | re.S)
-            if mm:
-                excerpt = _html_to_text(mm.group(1))[:300]
+                excerpt = ""
+                if m:
+                    s = max(0, m.start() - 400)
+                    chunk = html[s:m.end()+400]
+                    mm = re.search(r'(?:class="[^"]*(?:excerpt|summary)[^"]*">)(.*?)(?:</(?:div|p)>)',
+                                   chunk, flags=re.I | re.S)
+                    if mm:
+                        excerpt = _html_to_text(mm.group(1))[:300]
 
-        items.append({
-            "page_id": str(pid),
-            "title": title or f"Page {pid}",
-            "url": page_view_url(pid),
-            "excerpt": excerpt
-        })
-    dbg("HTML_FALLBACK: items:", len(items))
-    return {"items": items}
+                items.append({"page_id": str(pid), "title": title or f"Page {pid}",
+                              "url": page_view_url(pid), "excerpt": excerpt})
+            dbg("HTML_FALLBACK: items:", len(items))
+            return {"items": items}
+
+        # 서버 에러/비-HTML이면 백오프 재시도
+        dbg("HTML_FALLBACK: server err or non-html -> retry")
+        time.sleep(0.6 * (i + 1))
+
+    dbg("HTML_FALLBACK: final fail -> [] status=", getattr(last_r, "status_code", None))
+    return {"items": []}
 
 def _html_to_text(html: str) -> str:
     # 아주 라이트한 HTML→텍스트 변환 (필요하면 BeautifulSoup로 교체 가능)
@@ -169,7 +191,7 @@ def tool_search(payload: dict = Body(...)):
     """
     query = (payload or {}).get("query", "")
     limit = int((payload or {}).get("limit", 5) or 5)
-    space = (payload or {}).get("space") or DEFAULT_SPACE
+    space = (payload or {}).get("space") or None
 
     dbg("SEARCH: query=", query, "space=", space, "limit=", limit)
 
@@ -179,13 +201,16 @@ def tool_search(payload: dict = Body(...)):
         dbg("SEARCH: empty after _to_cql_text -> return []")
         return {"items": []}
 
-    # 2) CQL 구성
-    parts = ['type=page', f'text ~ "{text}"']
+    tokens = _to_cql_tokens(text)
+    
+    parts = ['type=page']
+    if tokens:
+        parts.append("(" + " OR ".join([f'text ~ "{t}"' for t in tokens]) + ")")
+    else:
+        parts.append(f'text ~ "{text}"')
     if space:
         parts.append(f"space={space}")
     cql = " AND ".join(parts)
-
-    # [DEBUG] CQL 찍기
     dbg("CQL:", cql)
 
     params = {
@@ -258,14 +283,14 @@ def tool_page_text(page_id: str):
     dbg("PAGE_TEXT: REST ->", r.status_code, ct, url)
 
     # 401/403이면 쿠키 폴백
-    if r.status_code in (401, 403):
-        dbg("PAGE_TEXT: 401/403 -> cookie fallback")
+    if r.status_code in (401, 403, 404, 302) or "application/json" not in ct:
+        dbg("PAGE_TEXT: cookie retry before viewstorage pageId=", page_id)
         s = ensure_cookie_session()
         r = s.get(url, params=params, timeout=30)
         ct = (r.headers.get("content-type") or "").lower()
         dbg("PAGE_TEXT: REST(retry-cookie) ->", r.status_code, ct, url)
 
-    # [추가] REST가 404/403/302거나 JSON이 아니면 viewstorage 폴백
+    # REST가 404/403/302거나 JSON이 아니면 viewstorage 폴백
     ct = (r.headers.get("content-type") or "").lower()
     dbg("PAGE_TEXT: REST ->", r.status_code, ct, url)
     if r.status_code in (401, 403, 404, 302) or "application/json" not in ct:
@@ -292,6 +317,21 @@ def tool_page_text(page_id: str):
                 if mm: title = mm.group(1).strip()
             dbg("PAGE_TEXT: viewstorage ok. title(len)=", len(title), "text(len)=", len(text))
             return {"page_id": page_id, "title": title or f"Page {page_id}", "text": text[:200_000]}
+        
+        dbg("PAGE_TEXT: try REST export_view fallback")
+        try:
+            r2 = s.get(f"{BASE_URL}/rest/api/content/{quote_plus(str(page_id))}",
+                       params={"expand": "body.export_view,title"},
+                       timeout=30)
+            if r2.ok and "application/json" in (r2.headers.get("content-type","").lower()):
+                js2 = r2.json() or {}
+                title2 = js2.get("title") or ""
+                html2 = ((js2.get("body") or {}).get("export_view") or {}).get("value", "")
+                text2 = _html_to_text(html2)
+                dbg("PAGE_TEXT: export_view ok. title(len)=", len(title2), "text(len)=", len(text2))
+                return {"page_id": page_id, "title": title2 or f"Page {page_id}", "text": text2[:200_000]}
+        except Exception as ee:
+            dbg("PAGE_TEXT: export_view exception:", repr(ee))
 
     # 기존 REST 성공 경로
     if r.status_code == 404:
@@ -344,21 +384,17 @@ def get_session_for_rest() -> requests.Session:
     return s
 
 def ensure_cookie_session() -> requests.Session:
-    """폼 로그인(JSESSIONID)으로 쿠키 세션 생성"""
     dbg("AUTH: ensure_cookie_session()")
     s = requests.Session()
     s.verify = VERIFY_SSL
     s.headers.update({"Accept": "application/json"})
-
-    form = {
-        "os_username": USER,
-        "os_password": PASSWORD,
-        "os_destination": "/",   # 로그인 후 리다이렉트 목적지
-        "login": "Log In",       # 일부 테마/버전에서 필요
-    }
-    s.post(f"{BASE_URL}/dologin.action",
-           data=form,
-           allow_redirects=True,
+    form = {"os_username": USER, "os_password": PASSWORD, "os_destination": "/", "login": "Log In"}
+    s.post(f"{BASE_URL}/dologin.action", data=form, allow_redirects=True,
            headers={"X-Atlassian-Token": "no-check"})
+    # 디버깅에 유용: 민감값은 출력 안 하고 키만 확인
+    try:
+        dbg("AUTH: cookie keys=", list(s.cookies.get_dict().keys()))
+    except Exception:
+        pass
     dbg("AUTH: cookie session ready")
     return s
