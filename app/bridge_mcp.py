@@ -29,7 +29,7 @@ def rag_query(q: str, k: int) -> Dict[str, Any]:
 def rag_upsert_docs(docs):
     payload = {"docs": docs}
     tried, last = [], None
-    for path in ["/upsert", "/ingest", "/v1/upsert", "/v1/ingest", "/documents/upsert"]:
+    for path in ["/documents/upsert", "/upsert", "/ingest", "/v1/upsert", "/v1/ingest"]:
         url = f"{RAG}{path}"
         try:
             r = requests.post(url, json=payload, timeout=120)
@@ -42,8 +42,11 @@ def rag_upsert_docs(docs):
     raise HTTPException(500, f"RAG upsert failed. Tried={tried} last={last}")
 
 # --- MCP HTTP Wrapper 유틸 ---
-def mcp_conf_search(query: str, limit: int) -> List[Dict[str, Any]]:
-    r = requests.post(f"{MCP}/tool/search", json={"query": query, "limit": limit}, timeout=30)
+def mcp_conf_search(query: str, limit: int, space: Optional[str] = None) -> List[Dict[str, Any]]:
+    payload = {"query": query, "limit": limit}
+    if space:
+        payload["space"] = space
+    r = requests.post(f"{MCP}/tool/search", json=payload, timeout=30)
     r.raise_for_status()
     return (r.json() or {}).get("items", []) or []
 
@@ -61,7 +64,7 @@ def mcp_conf_attachments(page_id: str, types: str = "pdf,img", limit: int = 10) 
 
 def mcp_conf_attachment_text(attachment_id: str, max_pages: Optional[int] = None) -> Dict[str, Any]:
     params = {"max_pages": max_pages} if max_pages else {}
-    r = requests.get(f"{MCP}/tool/attachment_text/{attachment_id}", params=params, timeout=120)
+    r = requests.get(f"{MCP}/tool/attachment_text/{attachment_id}", params=params, timeout=180)
     r.raise_for_status()
     return r.json() or {}
 
@@ -77,7 +80,7 @@ class SearchAndIngestReq(BaseModel):
     att_types: Optional[str] = "pdf,img"                # pdf,img | pdf | img
     att_limit: Optional[int] = 10                       # 첨부 최대 개수
     att_ocr_max_pages: Optional[int] = 3                # PDF 앞쪽 N페이지만 OCR
-
+    space: Optional[str] = None
 @app.post("/search_and_ingest_mcp")
 async def search_and_ingest(req: SearchAndIngestReq):
     # [CHANGE] 스코어 해석 보강: score 우선, 없으면 distance를 유사도로 변환
@@ -132,7 +135,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
             found = []
             for i in range(3):
                 try:
-                    found = mcp_conf_search(q, limit=(req.max_pages or k)) or []
+                    found = mcp_conf_search(q, limit=(req.max_pages or k), space=req.space)
                     break
                 except Exception:
                     await asyncio.sleep(0.6 * (i + 1))
