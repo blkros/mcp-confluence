@@ -23,6 +23,15 @@ if not BASE_URL:
 # --- [CONST/UTILS] ---
 SEARCH_API  = f"{BASE_URL}/rest/api/search"
 CONTENT_API = f"{BASE_URL}/rest/api/content"
+_YEAR_RE = re.compile(r'(?:19|20)\d{2}')
+
+def _year_tokens(q: str) -> list[str]:
+    years = _YEAR_RE.findall(q or "")
+    out = []
+    for y in years:
+        out.append(y)
+        out.append(f"{y}년")
+    return out
 
 def page_view_url(page_id: str) -> str:
     # Confluence Server/DC 공통 보기 URL
@@ -64,6 +73,7 @@ def _to_cql_tokens(q: str, min_len: int = 2, max_tokens: int = 6):
     q = (q or "").strip()
     q = re.sub(r'["“”\'’]', ' ', q)
     toks = re.split(r'[\s\W]+', q)
+    toks += _year_tokens(q)
     seen, out = set(), []
     for t in toks:
         t = t.strip()
@@ -208,7 +218,9 @@ def tool_search(payload: dict = Body(...)):
     
     parts = ['type=page']
     if tokens:
-        parts.append("(" + " OR ".join([f'text ~ "{t}"' for t in tokens]) + ")")
+        title_or = " OR ".join([f'title ~ "{t}"' for t in tokens])
+        text_and = " AND ".join([f'text ~ "{t}"' for t in tokens])
+        parts.append(f"(({title_or}) OR ({text_and}))")
     else:
         parts.append(f'text ~ "{text}"')
     if space:
