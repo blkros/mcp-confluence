@@ -3,12 +3,14 @@
 #      → 브릿지(bridge_mcp.py)에서 이걸 호출해서 검색/본문을 받아간다.
 
 # --- [IMPORTS] ---
-import os, re, time
+import os, re, time, io
 import typing as t
-import requests
+import requests, pytesseract
 from urllib.parse import quote, quote_plus
 from fastapi import FastAPI, Body, HTTPException
 from requests.utils import quote as _rquote
+from PIL import Image
+from pdf2image import convert_from_bytes
 
 # --- [ENV] 기존 main.py와 동일 이름 사용 ---
 BASE_URL = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
@@ -16,6 +18,11 @@ USER = os.environ.get("CONFLUENCE_USER") or ""
 PASSWORD = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 DEFAULT_SPACE = os.getenv("CONF_DEFAULT_SPACE", "").strip() or None
+
+OCR_ENABLED = (os.getenv("OCR_ENABLED","false").lower() in ("1","true","yes"))
+OCR_LANG    = os.getenv("OCR_LANG","kor+eng")
+OCR_MAX_PAGES = int(os.getenv("OCR_MAX_PAGES","5"))
+OCR_MAX_BYTES = int(os.getenv("OCR_MAX_BYTES","10485760"))
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
@@ -53,6 +60,17 @@ _CQL_BAD  = re.compile(r'["\n\r\t]+')
 CQL_MAX   = 120
 
 DEBUG = (os.getenv("CONF_DEBUG") or "false").lower() in ("1","true","yes")
+
+def _ocr_image_bytes(b: bytes) -> str:
+    img = Image.open(io.BytesIO(b))
+    return pytesseract.image_to_string(img, lang=OCR_LANG)
+
+def _ocr_pdf_bytes(b: bytes, max_pages: int) -> str:
+    pages = convert_from_bytes(b, first_page=1, last_page=max_pages, dpi=180)
+    texts = []
+    for p in pages:
+        texts.append(pytesseract.image_to_string(p, lang=OCR_LANG))
+    return "\n\n".join(t.strip() for t in texts if t and t.strip())
 
 def dbg(*a):
     if DEBUG:
@@ -181,16 +199,22 @@ def _html_search_fallback(sess: requests.Session, text: str, space: t.Optional[s
     return {"items": []}
 
 def _html_to_text(html: str) -> str:
-    # 아주 라이트한 HTML→텍스트 변환 (필요하면 BeautifulSoup로 교체 가능)
     if not html:
         return ""
-    text = (html.replace("</p>", "\n")
-                .replace("<br/>", "\n")
-                .replace("<br>", "\n")
-                .replace("<li>", "- ")
-                .replace("</li>", "\n"))
-    text = re.sub(r"<[^>]+>", "", text)     # 태그 날리기
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 표 구조 보존
+    html = re.sub(r'</(th|td)>', ' | ', html, flags=re.I)
+    html = re.sub(r'</tr>', '\n', html, flags=re.I)
+    # 줄바꿈/리스트 보존
+    html = re.sub(r'<br\s*/?>', '\n', html, flags=re.I)
+    html = html.replace('</p>', '\n')
+    html = re.sub(r'<li>', '- ', html, flags=re.I)
+    html = re.sub(r'</li>', '\n', html, flags=re.I)
+    # 나머지 태그 제거
+    text = re.sub(r'<[^>]+>', '', html)
+    # 공백 정리
+    text = re.sub(r'\s*\|\s*', ' | ', text)
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 # --- [FASTAPI APP] ---
@@ -223,6 +247,12 @@ def tool_search(payload: dict = Body(...)):
         parts.append("(" + " OR ".join([f'(title ~ "{t}" OR text ~ "{t}")' for t in tokens]) + ")")
     else:
         parts.append(f'(title ~ "{text}" OR text ~ "{text}")')
+            
+    years = _YEAR_RE.findall(text)
+    if years:
+        year_clause = " OR ".join([f'(title ~ "{y}" OR text ~ "{y}" OR text ~ "{y}년")' for y in years])
+        parts.append("(" + year_clause + ")")
+        
     if space:
         parts.append(f"space={space}")
     cql = " AND ".join(parts)
@@ -287,6 +317,78 @@ def tool_search(payload: dict = Body(...)):
         excerpt = _html_to_text(res.get("excerpt") or "")[:300]
         items.append({"page_id": pid, "title": title, "url": page_view_url(pid), "excerpt": excerpt})
     dbg("SEARCH: REST items:", len(items))
+    return {"items": items}
+
+@api.get("/tool/attachment_text/{attachment_id}")
+def attachment_text(attachment_id: str, max_pages: int = None):
+    """
+    출력: { attachment_id, title, text, url }
+    - PDF: 앞쪽 N페이지만 OCR (기본 OCR_MAX_PAGES)
+    - 이미지: 전체 이미지 OCR
+    """
+    if not OCR_ENABLED:
+        raise HTTPException(400, "OCR is disabled")
+
+    # 첨부 메타 조회
+    s = get_session_for_rest()
+    r = s.get(f"{CONTENT_API}/{quote_plus(attachment_id)}", params={"expand": "version,_links,title,metadata"}, timeout=30)
+    if r.status_code == 404:
+        raise HTTPException(404, "Attachment not found")
+    r.raise_for_status()
+    a = r.json() or {}
+    title = a.get("title") or attachment_id
+    mt = (a.get("metadata") or {}).get("mediaType") or a.get("mimeType") or ""
+    links = a.get("_links") or {}
+    dlrel = links.get("download") or ""
+    url = f"{BASE_URL}{dlrel}" if dlrel.startswith("/") else dlrel
+
+    # 다운로드
+    rb = s.get(url, timeout=60)
+    rb.raise_for_status()
+    data = rb.content or b""
+    if len(data) > OCR_MAX_BYTES:
+        raise HTTPException(413, f"Attachment too large for OCR (> {OCR_MAX_BYTES} bytes)")
+
+    # OCR
+    text = ""
+    if mt == "application/pdf":
+        text = _ocr_pdf_bytes(data, max_pages or OCR_MAX_PAGES)
+    elif mt.startswith("image/"):
+        text = _ocr_image_bytes(data)
+    else:
+        raise HTTPException(415, f"Unsupported mediaType for OCR: {mt}")
+
+    # 가독성 정리
+    text = re.sub(r'[ \t]+\n', '\n', text or "")
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return {"attachment_id": attachment_id, "title": title, "url": url, "text": text[:200_000]}
+
+@api.get("/tool/attachments/{page_id}")
+def list_attachments(page_id: str, types: str = "pdf,img", limit: int = 20):
+    """
+    출력: { items: [ {attachment_id,title,mediaType,url,version} ] }
+    types: "pdf,img" | "pdf" | "img"
+    """
+    s = get_session_for_rest()
+    r = s.get(f"{CONTENT_API}/{quote_plus(page_id)}/child/attachment", params={"limit": limit}, timeout=30)
+    r.raise_for_status()
+    js = r.json() or {}
+    results = js.get("results") or []
+    want_pdf = "pdf" in types
+    want_img = "img" in types
+
+    items = []
+    for a in results:
+        mid = str(a.get("id") or "")
+        mt  = (a.get("metadata") or {}).get("mediaType") or a.get("mimeType") or ""
+        title = a.get("title") or mid
+        links = a.get("_links") or {}
+        dlrel = links.get("download") or ""
+        url = f"{BASE_URL}{dlrel}" if dlrel.startswith("/") else dlrel
+
+        if (want_pdf and mt == "application/pdf") or (want_img and mt.startswith("image/")):
+            ver = (a.get("version") or {}).get("number") or 1
+            items.append({"attachment_id": mid, "title": title, "mediaType": mt, "url": url, "version": ver})
     return {"items": items}
 
 @api.get("/tool/page_text/{page_id}")
