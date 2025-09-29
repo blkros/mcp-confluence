@@ -35,8 +35,11 @@ session.verify = VERIFY_SSL
 session.headers.update({"Accept": "application/json"})
 
 # 키워드/질의 정제(너무 시끄러운 토큰 제거)
-_STOP = {"task","guidelines","output","chat","history","assistant","user",
-         "제목","태그","대화","요약","가이드","출력"}
+_STOP = {
+    "task","guidelines","output","chat","history","assistant","user",
+    "제목","태그","대화","요약","가이드","출력",
+    "query","queries","질문","설명","설명해주세요","간단히","간단","해주세요","해줘"
+}
 _CQL_BAD  = re.compile(r'["\n\r\t]+')
 CQL_MAX   = 120
 
