@@ -190,7 +190,7 @@ def _html_to_text(html: str) -> str:
                 .replace("<li>", "- ")
                 .replace("</li>", "\n"))
     text = re.sub(r"<[^>]+>", "", text)     # 태그 날리기
-    text = re.sub(r"\n{3,}", "\n\n", text)  # 빈 줄 정리
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 # --- [FASTAPI APP] ---
@@ -204,7 +204,7 @@ def tool_search(payload: dict = Body(...)):
     """
     query = (payload or {}).get("query", "")
     limit = int((payload or {}).get("limit", 5) or 5)
-    space = (payload or {}).get("space") or None
+    space = (payload or {}).get("space") or DEFAULT_SPACE
 
     dbg("SEARCH: query=", query, "space=", space, "limit=", limit)
 
@@ -220,9 +220,9 @@ def tool_search(payload: dict = Body(...)):
     if tokens:
         title_or = " OR ".join([f'title ~ "{t}"' for t in tokens])
         text_and = " AND ".join([f'text ~ "{t}"' for t in tokens])
-        parts.append(f"(({title_or}) OR ({text_and}))")
+        parts.append("(" + " OR ".join([f'(title ~ "{t}" OR text ~ "{t}")' for t in tokens]) + ")")
     else:
-        parts.append(f'text ~ "{text}"')
+        parts.append(f'(title ~ "{text}" OR text ~ "{text}")')
     if space:
         parts.append(f"space={space}")
     cql = " AND ".join(parts)
@@ -255,6 +255,16 @@ def tool_search(payload: dict = Body(...)):
             return _html_search_fallback(s, text, space, limit)
 
         js = r.json() or {}
+        results = js.get("results") or []
+        if space and not results:
+            dbg("SEARCH: no hits in space, retry without space")
+            cql_no_space = re.sub(r'\s+AND\s+space\s*=\s*\S+', '', cql)
+            params_no_space = {**params, "cql": cql_no_space}
+            r = s.get(SEARCH_API, params=params_no_space, timeout=30)
+            if r.ok and "application/json" in (r.headers.get("content-type","").lower()):
+                js = r.json() or {}
+                results = js.get("results") or []
+
     except Exception as e:
         dbg("REST path exception:", repr(e), "-> try HTML fallback")
         try:
