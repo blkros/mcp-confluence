@@ -15,7 +15,10 @@ app = FastAPI()
 RAG   = os.environ.get("RAG_PROXY", "http://rag-proxy:8080").rstrip("/")
 MCP   = os.environ.get("MCP_BASE",  "http://mcp-confluence:9001").rstrip("/")
 TOP_K = int(os.environ.get("TOP_K", "12"))
-THRESH = float(os.environ.get("THRESH", "0.73"))
+
+# [CHANGE] 허위/일반지식 답변 억제를 위해 임계값 기본을 0.83으로 상향 권장
+# [WHY] 0.7대는 헛컨텍스트 주입 위험. 0.8대가 안전.
+THRESH = float(os.environ.get("THRESH", "0.83"))
 
 # --- RAG 유틸 ---
 def rag_query(q: str, k: int) -> Dict[str, Any]:
@@ -49,6 +52,19 @@ def mcp_conf_page_text(page_id: str) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json() or {}
 
+# [ADD] 첨부 목록 조회 + OCR 텍스트 추출 호출
+def mcp_conf_attachments(page_id: str, types: str = "pdf,img", limit: int = 10) -> List[Dict[str, Any]]:
+    # [WHY] 표/스캔이 많은 페이지를 위해 첨부도 인덱싱
+    r = requests.get(f"{MCP}/tool/attachments/{page_id}", params={"types": types, "limit": limit}, timeout=30)
+    r.raise_for_status()
+    return (r.json() or {}).get("items", []) or []
+
+def mcp_conf_attachment_text(attachment_id: str, max_pages: Optional[int] = None) -> Dict[str, Any]:
+    params = {"max_pages": max_pages} if max_pages else {}
+    r = requests.get(f"{MCP}/tool/attachment_text/{attachment_id}", params=params, timeout=120)
+    r.raise_for_status()
+    return r.json() or {}
+
 # --- API 모델 ---
 class SearchAndIngestReq(BaseModel):
     query: str
@@ -56,11 +72,32 @@ class SearchAndIngestReq(BaseModel):
     threshold: Optional[float] = None
     max_pages: Optional[int] = None  # MCP에서 최대 가져올 페이지 수
 
+    # [ADD] 첨부 OCR 업서트 제어 옵션
+    include_attachments: Optional[bool] = True          # 기본 on
+    att_types: Optional[str] = "pdf,img"                # pdf,img | pdf | img
+    att_limit: Optional[int] = 10                       # 첨부 최대 개수
+    att_ocr_max_pages: Optional[int] = 3                # PDF 앞쪽 N페이지만 OCR
+
 @app.post("/search_and_ingest_mcp")
 async def search_and_ingest(req: SearchAndIngestReq):
+    # [CHANGE] 스코어 해석 보강: score 우선, 없으면 distance를 유사도로 변환
+    def _score_of(hit: Dict[str, Any]) -> float:
+        try:
+            if "score" in hit and hit["score"] is not None:
+                return float(hit["score"])
+            # 일부 백엔드는 distance만 줄 수 있음
+            d = hit.get("distance")
+            if d is None:
+                return 0.0
+            d = float(d)
+            # 0~1 거리면 1-d, 그 외엔 1/(1+d)로 간이 변환
+            return (1.0 - d) if 0.0 <= d <= 1.0 else 1.0 / (1.0 + d)
+        except Exception:
+            return 0.0
+
     def _best_score(xs):
         try:
-            return max(float(x.get("score") or 0.0) for x in xs) if xs else 0.0
+            return max(_score_of(x) for x in xs) if xs else 0.0
         except Exception:
             return 0.0
 
@@ -102,6 +139,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
             if not isinstance(found, list):
                 found = []
             print("[mcp] found (search) =", len(found), flush=True)
+
             # 2-2) 본문 수집 (간단 재시도)
             new_docs = []
             for it in found:
@@ -119,6 +157,7 @@ async def search_and_ingest(req: SearchAndIngestReq):
 
                 text  = (page.get("text") or "").strip()
                 title = (page.get("title") or it.get("title") or "").strip()
+                url   = (it.get("url") or "").strip()
                 if not text:
                     continue
 
@@ -128,10 +167,46 @@ async def search_and_ingest(req: SearchAndIngestReq):
                     "metadata": {
                         "source": "confluence",
                         "title": title,
-                        "url": it.get("url") or "",
+                        "url": url,
                     }
                 })
+
+                # [ADD] 2-2-b 첨부 OCR 인덱싱 (옵션)
+                if req.include_attachments:
+                    try:
+                        atts = mcp_conf_attachments(pid, types=(req.att_types or "pdf,img"),
+                                                    limit=int(req.att_limit or 10)) or []
+                    except Exception:
+                        atts = []
+
+                    for a in atts:
+                        att_id = str(a.get("attachment_id") or "").strip()
+                        if not att_id:
+                            continue
+                        try:
+                            att = mcp_conf_attachment_text(att_id, max_pages=req.att_ocr_max_pages)
+                        except Exception:
+                            continue
+
+                        att_text = (att.get("text") or "").strip()
+                        if not att_text:
+                            continue
+
+                        att_title = (a.get("title") or att.get("title") or "").strip()
+                        att_url   = (a.get("url") or att.get("url") or url or "").strip()
+
+                        new_docs.append({
+                            "id": f"confluence:{pid}:att:{att_id}",
+                            "text": att_text[:200_000],
+                            "metadata": {
+                                "source": "confluence",
+                                "title": f"{title} (첨부: {att_title})" if title else att_title,
+                                "url": att_url,
+                            }
+                        })
+
             print("[mcp] new_docs to upsert =", len(new_docs), flush=True)
+
             # 2-3) 업서트 & 재조회 (실패해도 무시)
             if new_docs:
                 try:
@@ -150,13 +225,14 @@ async def search_and_ingest(req: SearchAndIngestReq):
                     pass
 
         # 3) 최종 스니펫 반환 (항상 200)
+        # [WHY] hits의 meta(title/url)는 위 업서트 metadata로 저장되어 재조회 시 함께 나옴
         return {
             "used_fallback": used_fallback,
             "top_score": float(top_score or 0.0),
             "hits": [
                 {
                     "chunk": (h.get("text") or h.get("chunk") or "")[:1200],
-                    "score": float(h.get("score") or 0.0),
+                    "score": float(_score_of(h)),
                     "meta":  (h.get("metadata") or h.get("meta") or {})
                 } for h in (items or [])
             ]

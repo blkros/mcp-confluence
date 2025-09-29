@@ -252,10 +252,11 @@ def tool_search(payload: dict = Body(...)):
     if years:
         year_clause = " OR ".join([f'(title ~ "{y}" OR text ~ "{y}" OR text ~ "{y}년")' for y in years])
         parts.append("(" + year_clause + ")")
-        
+
     if space:
         parts.append(f"space={space}")
-    cql = " AND ".join(parts)
+
+    cql = " AND ".join(parts) + " order by lastmodified desc"
     dbg("CQL:", cql)
 
     params = {
