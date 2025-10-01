@@ -8,7 +8,7 @@ import typing as t
 import requests
 from urllib.parse import quote, quote_plus
 from fastapi import FastAPI, Body, HTTPException
-from requests.utils import quote as _rquote
+# from requests.utils import quote as _rquote
 
 # --- [ENV] 기존 main.py와 동일 이름 사용 ---
 BASE_URL = (os.environ.get("CONFLUENCE_BASE_URL") or "").rstrip("/")
@@ -194,10 +194,6 @@ def tool_search(payload: dict = Body(...)):
     if r.status_code == 400:
         return {"items": []}
     r.raise_for_status()
-    # ---- REST 성공 후 (r.raise_for_status() 다음 줄부터 추가)
-    if r.status_code == 400:
-        return {"items": []}
-    r.raise_for_status()
 
     js = r.json() or {}
     results = js.get("results") or []
@@ -217,7 +213,6 @@ def tool_search(payload: dict = Body(...)):
             "url": page_view_url(pid),
             "excerpt": excerpt
         })
-
     return {"items": items}
 
 @api.get("/tool/page_text/{page_id}")
@@ -267,6 +262,7 @@ def tool_page_text(page_id: str):
     if r.status_code == 404:
         raise HTTPException(404, "Confluence page not found")
     r.raise_for_status()
+    
     js   = r.json() or {}
     title = js.get("title") or ""
     html  = ((js.get("body") or {}).get("storage") or {}).get("value", "")
