@@ -3,7 +3,7 @@
 #       1) RAG 1차 조회 -> 스코어 낮으면
 #       2) MCP(Confluence HTTP wrapper) 검색/본문 수집 -> RAG 업서트 -> 재조회
 
-import os, requests
+import os, re, requests  # [# CHANGED] re 임포트 추가
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -14,7 +14,30 @@ app = FastAPI()
 RAG   = os.environ.get("RAG_PROXY", "http://rag-proxy:8080").rstrip("/")
 MCP   = os.environ.get("MCP_BASE",  "http://mcp-confluence:9001").rstrip("/")
 TOP_K = int(os.environ.get("TOP_K", "5"))
-THRESH= float(os.environ.get("THRESH", "0.83"))
+
+# [# CHANGED] 기본 임계값을 낮추고(0.65 권장), 환경변수로 조절
+THRESH= float(os.environ.get("THRESH", "0.65"))
+
+# [# ADDED] 폴백을 훨씬 보수적으로: 스코어 낮고(hit도 적을 때)만
+FALLBACK_MIN_HITS = int(os.environ.get("FALLBACK_MIN_HITS", "2"))  # hits가 너무 적을 때만 폴백
+
+# [# ADDED] Confluence Space 강제 제한(HTTP wrapper에 전달)
+CONF_SPACE = os.environ.get("CONFLUENCE_SPACE") or os.environ.get("CONF_DEFAULT_SPACE")
+
+# [# ADDED] 메타 프롬프트/이력 덤프 차단 정규식
+_META_PATTERNS = (
+    r"^\s*###\s*task",            # ### Task:
+    r"json\s*format",             # JSON format:
+    r"<\s*chat_history\s*>",      # <chat_history>
+    r"follow[-\s]*ups?",          # follow-up(s)
+    r"title\s+with\s+an\s+emoji", # title with an emoji
+    r"tags\s+categorizing",       # tags categorizing
+    r"^query:\s*history",         # Query: History:
+    r"^\s*history:",              # History:
+)
+def _is_meta_query(q: str) -> bool:
+    s = (q or "").lower()
+    return any(re.search(p, s) for p in _META_PATTERNS)
 
 # --- RAG 유틸 ---
 def rag_query(q: str, k: int) -> Dict[str, Any]:
@@ -39,7 +62,11 @@ def rag_upsert_docs(docs):
 
 # --- MCP HTTP Wrapper 유틸 ---
 def mcp_conf_search(query: str, limit: int) -> List[Dict[str, Any]]:
-    r = requests.post(f"{MCP}/tool/search", json={"query": query, "limit": limit}, timeout=30)
+    # [# CHANGED] space를 HTTP wrapper에 전달(서버 측에서 DEFAULT_SPACE 없을 수도 있으므로)
+    payload = {"query": query, "limit": limit}
+    if CONF_SPACE:  # [# ADDED]
+        payload["space"] = CONF_SPACE  # [# ADDED]
+    r = requests.post(f"{MCP}/tool/search", json=payload, timeout=30)
     r.raise_for_status()
     return (r.json() or {}).get("items", []) or []
 
@@ -63,6 +90,14 @@ def search_and_ingest(req: SearchAndIngestReq):
     if not q:
         raise HTTPException(400, "query is empty")
 
+    # [# ADDED] 메타 프롬프트/요약 생성류는 검색/폴백을 아예 수행하지 않음
+    if _is_meta_query(q):  # [# ADDED]
+        return {          # [# ADDED] 불필요한 Confluence 트래픽 차단
+            "used_fallback": False,
+            "top_score": 1.0,
+            "hits": []
+        }
+
     # 1) 1차 조회
     qres = rag_query(q, k)
 
@@ -83,14 +118,24 @@ def search_and_ingest(req: SearchAndIngestReq):
     top_score = float(qres.get("top_score") or _best_score(items))
 
     used_fallback = False
-    if top_score < th:
+
+    # [# CHANGED] 폴백 조건: (히트 없음) 또는 (스코어 낮고 히트도 적음) 일 때만
+    need_fallback = (not items) or (top_score < th and len(items) < max(1, min(k, FALLBACK_MIN_HITS)))  # [# ADDED]
+
+    if need_fallback:  # [# CHANGED]
         # 2) MCP 검색 → 본문 수집 → 업서트
         found = mcp_conf_search(q, limit=req.max_pages or k)
         new_docs: List[Dict[str, Any]] = []
+
+        # [# ADDED] 단일 실행 내 중복 page 방지
+        seen = set()
+
         for it in found:
             pid = it.get("page_id")
-            if not pid:
+            if not pid or pid in seen:
                 continue
+            seen.add(pid)
+
             page = mcp_conf_page_text(pid)
             text  = (page.get("text") or "").strip()
             title = page.get("title") or it.get("title") or ""
@@ -105,6 +150,7 @@ def search_and_ingest(req: SearchAndIngestReq):
                     "url": it.get("url") or "",
                 }
             })
+
         if new_docs:
             rag_upsert_docs(new_docs)
             used_fallback = True
