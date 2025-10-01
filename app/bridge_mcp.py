@@ -24,6 +24,34 @@ FALLBACK_MIN_HITS = int(os.environ.get("FALLBACK_MIN_HITS", "2"))  # hits가 너
 # [# ADDED] Confluence Space 강제 제한(HTTP wrapper에 전달)
 CONF_SPACE = os.environ.get("CONFLUENCE_SPACE") or os.environ.get("CONF_DEFAULT_SPACE")
 
+_OVERVIEW_HINTS = ["개요", "소개", "요약", "Overview", "Summary"]
+
+def _normalize_ko_query(q: str) -> str:
+    s = (q or "").strip()
+    # 흔한 접두/메타 조각 제거
+    s = re.sub(r"(?i)^query\s*:\s*history:?", " ", s)
+    s = re.sub(r"(?i)^history\s*:\s*", " ", s)
+    s = re.sub(r"[\"“”’‘'`]+", " ", s)
+    # “~에 대해/대하여/관련” 같은 조사/연결어 날리기
+    s = re.sub(r"\s*에\s*대(?:해|하여?)\s*", " ", s)
+    s = re.sub(r"\s*관련\s*", " ", s)
+    # 정중어/명령어 제거
+    s = re.sub(r"(간단히|간단하게|좀|조금|자세히)\s*", " ", s)
+    s = re.sub(r"(설명|알려|요약)\s*해\s*주(?:세요|실래요|나요|라|요)?", " ", s)
+    s = re.sub(r"(설명|알려|요약)\s*해\s*줘(?:요)?", " ", s)
+    s = re.sub(r"(무엇인가요|무엇인가요\?|뭔가요\?|뭐야\?|뭐야)", " ", s)
+    # 공백 정리
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _boost_overview(q: str) -> str:
+    # “프로젝트” 언급이 있거나 질문형이면 개요 계열 키워드 추가 부스팅
+    base = q
+    if ("프로젝트" in q) or re.search(r"(개요|소개|요약|overview|summary)", q, re.I):
+        extra = " ".join(_OVERVIEW_HINTS)
+        base = f"{q} {extra}"
+    return base
+
 # [# ADDED] 메타 프롬프트/이력 덤프 차단 정규식
 _META_PATTERNS = (
     r"^\s*###\s*task",            # ### Task:
@@ -97,9 +125,12 @@ def search_and_ingest(req: SearchAndIngestReq):
             "top_score": 1.0,
             "hits": []
         }
+    
+    q_norm = _normalize_ko_query(q)
+    q_eff  = _boost_overview(q_norm)
 
     # 1) 1차 조회
-    qres = rag_query(q, k)
+    qres = rag_query(q_eff, k)
 
     # rag-proxy 응답 호환: items(list), hits(int)
     items = []
@@ -124,7 +155,7 @@ def search_and_ingest(req: SearchAndIngestReq):
 
     if need_fallback:  # [# CHANGED]
         # 2) MCP 검색 → 본문 수집 → 업서트
-        found = mcp_conf_search(q, limit=req.max_pages or k)
+        found = mcp_conf_search(q_eff, limit=req.max_pages or k)
         new_docs: List[Dict[str, Any]] = []
 
         # [# ADDED] 단일 실행 내 중복 page 방지
