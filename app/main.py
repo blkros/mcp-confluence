@@ -1,9 +1,8 @@
 # mcp-confluence/main.py
 
-import os, re, httpx, asyncio
+import os, re, httpx
 import typing as t
 from urllib.parse import quote_plus
-from .html_fallback import search_html
 from mcp.server.fastmcp import FastMCP
 
 # ──────────────────────────────────────────────────────────────
@@ -92,8 +91,8 @@ def get_confluence_client() -> httpx.Client:
             verify=VERIFY_SSL, timeout=30.0
         )
         r = c.get("/rest/api/space?limit=1")
-        if r.status_code != 401:
-            return c  # Basic 성공
+        if r.status_code not in (401, 403):
+            return c  # OK
         c.close()
 
     # 2) 폼 로그인 폴백
@@ -254,13 +253,13 @@ def _get_page_impl(page_id: str) -> dict:
     finally:
         c2.close()
 
-def _browser_headers() -> dict:
-    return {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"{BASE_URL}/dashboard.action",
-        "Accept-Language": "ko,en;q=0.9",
-    }
+# def _browser_headers() -> dict:
+#     return {
+#         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+#         "User-Agent": "Mozilla/5.0",
+#         "Referer": f"{BASE_URL}/dashboard.action",
+#         "Accept-Language": "ko,en;q=0.9",
+#     }
 
 @mcp.tool()
 def get_page(page_id: str) -> dict:
@@ -523,10 +522,18 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
 
     return out
 
+# mcp-confluence/main.py (하단)
 from fastapi import FastAPI
 
 api = FastAPI()
-api.mount("/", mcp.sse_app())
+
+# FIX: 클라이언트 기본값(/sse)에 맞춤
+api.mount("/sse", mcp.sse_app())
+
+@api.get("/health")
+def health():
+    return {"status": "ok", "base_url": BASE_URL}
+
 if __name__ == "__main__":
     import os, uvicorn
     port = int(os.getenv("FASTMCP_PORT", "9000"))

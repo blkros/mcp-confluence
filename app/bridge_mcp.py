@@ -68,9 +68,11 @@ def _is_meta_query(q: str) -> bool:
     return any(re.search(p, s) for p in _META_PATTERNS)
 
 # --- RAG 유틸 ---
-def rag_query(q: str, k: int) -> Dict[str, Any]:
-    # [TIP] space 힌트를 RAG로도 넘기려면 json에 "space": "XXX" 추가 가능(지금은 Confluence에만 적용)
-    r = requests.post(f"{RAG}/query", json={"q": q, "k": k}, timeout=30)
+def rag_query(q: str, k: int, space: Optional[str] = None) -> Dict[str, Any]:
+    payload = {"q": q, "k": k}
+    if space:
+        payload["space"] = space       # ← rag-proxy가 space soft/hard 보너스를 활용
+    r = requests.post(f"{RAG}/query", json=payload, timeout=30)
     r.raise_for_status()
     return r.json() or {}
 
