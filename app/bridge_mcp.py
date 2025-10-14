@@ -7,6 +7,7 @@ import os, re, requests  # [# CHANGED] re 임포트 추가
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from bs4 import BeautifulSoup
 
 app = FastAPI()
 
@@ -23,8 +24,133 @@ FALLBACK_MIN_HITS = int(os.environ.get("FALLBACK_MIN_HITS", "2"))  # hits가 너
 
 # [추가] 컨테이너 글로벌 기본 space. 요청 단위 space가 오면 그걸 최우선 사용.
 CONF_SPACE = os.environ.get("CONFLUENCE_SPACE") or os.environ.get("CONF_DEFAULT_SPACE")
-
+CONF_BASE = os.environ.get("CONF_BASE", "").rstrip("/")
+CONF_USER = os.environ.get("CONF_USER")
+CONF_TOKEN = os.environ.get("CONF_TOKEN")
+_PAGEID_RE     = re.compile(r"(?:^|\b)(?:pageId:|cql:id=)(\d+)(?:\b|$)")
+_URL_PAGEID_RE = re.compile(r"[?&]pageId=(\d+)")
 _OVERVIEW_HINTS = ["개요", "소개", "요약", "Overview", "Summary"]
+MAX_DOC_CHARS = int(os.environ.get("MAX_DOC_CHARS", "200000"))
+
+def _html_to_text_with_tables(html: str) -> str:
+    """Confluence export_view/storage HTML에서 표(<table>)는 셀=탭, 행=개행으로 펴고
+    나머지는 개행 중심 텍스트로 변환"""
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # <br>를 개행으로
+    for br in soup.find_all(["br"]):
+        br.replace_with("\n")
+
+    lines = []
+
+    # 표 먼저 추출: 셀 → 탭, 행 → 개행
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["th", "td"])]
+            if cells:
+                lines.append("\t".join(cells))
+        table.decompose()  # 표는 추출했으니 본문에서 제거
+
+    # 표 외 나머지 텍스트
+    rest = soup.get_text("\n", strip=True)
+    if rest:
+        lines.append(rest)
+
+    return "\n".join([x for x in lines if x.strip()])
+
+def _fetch_page_via_rest(page_id: str) -> Dict[str, Any]:
+    """Confluence REST export_view → 표 보존 파싱"""
+    if not (CONF_BASE and CONF_USER and CONF_TOKEN):
+        raise RuntimeError("CONF_* env not set")
+
+    url = f"{CONF_BASE}/rest/api/content/{page_id}?expand=title,space,body.export_view,body.storage"
+    r = requests.get(url, auth=(CONF_USER, CONF_TOKEN), timeout=20)
+    if r.status_code == 404:
+        raise HTTPException(404, f"Confluence page not found: {page_id}")
+    r.raise_for_status()
+    j = r.json()
+
+    title = j.get("title") or ""
+    space = (j.get("space") or {}).get("key") or ""
+    html  = (((j.get("body") or {}).get("export_view") or {}).get("value")
+             or ((j.get("body") or {}).get("storage") or {}).get("value") or "")
+    text  = _html_to_text_with_tables(html)
+    url   = f"{CONF_BASE}/pages/viewpage.action?pageId={page_id}"
+
+    return {"page_id": page_id, "title": title, "space": space, "url": url, "text": text}
+
+def _fetch_page_via_mcp(page_id: str) -> Dict[str, Any]:
+    """MCP 래퍼가 제공하는 page_text 사용 (이미 텍스트화 되어 있을 가능성)"""
+    j = mcp_conf_page_text(page_id)  # 기존 유틸 재사용
+    title = j.get("title") or ""
+    text  = j.get("text") or ""
+    url   = j.get("url") or (f"{CONF_BASE}/pages/viewpage.action?pageId={page_id}" if CONF_BASE else "")
+    space = j.get("space") or ""
+    return {"page_id": page_id, "title": title, "space": space, "url": url, "text": text}
+
+def _try_exact_page_ingest(raw_query: str, space_hint: Optional[str]) -> Optional[Dict[str, Any]]:
+    """query 문자열에서 pageId/cql:id/URL 패턴을 감지하면 그 페이지만 인제스트하고 즉시 응답"""
+    q = (raw_query or "").strip()
+    if not q:
+        return None
+
+    m = _PAGEID_RE.search(q) or _URL_PAGEID_RE.search(q)
+    if not m:
+        return None
+
+    page_id = m.group(1)
+
+    # 1) 우선 REST로 (ENV가 있을 때)
+    try:
+        if CONF_BASE and CONF_USER and CONF_TOKEN:
+            page = _fetch_page_via_rest(page_id)
+        else:
+            page = _fetch_page_via_mcp(page_id)
+    except Exception as e:
+        # REST가 실패하면 MCP로 재시도
+        try:
+            page = _fetch_page_via_mcp(page_id)
+        except Exception:
+            raise HTTPException(502, f"failed to fetch page {page_id}: {e}")
+
+    text = (page.get("text") or "").strip()
+    if not text:
+        # 텍스트가 비면 인제스트 의미가 없음
+        raise HTTPException(502, f"empty page text for pageId={page_id}")
+
+    # 2) RAG 업서트
+    doc = {
+        "id": f"confluence:{page_id}",
+        "text": text[:MAX_DOC_CHARS],
+        "metadata": {
+            "source": "confluence",
+            "title": page.get("title") or "",
+            "url": page.get("url") or "",
+            "space": page.get("space") or (space_hint or ""),
+            "pageId": page_id,
+        },
+        # 호환성 위해 meta 도 같이 넣어줌(서버 쪽에서 하나만 써도 무방)
+        "meta": {
+            "source": "confluence",
+            "title": page.get("title") or "",
+            "url": page.get("url") or "",
+            "space": page.get("space") or (space_hint or ""),
+            "pageId": page_id,
+        }
+    }
+
+    rag_upsert_docs([doc])
+
+    # 3) 즉시 히트 형태로 반환 (shape은 기존 응답과 동일)
+    return {
+        "used_fallback": False,
+        "top_score": 1.0,
+        "hits": [{
+            "chunk": doc["text"][:1200],
+            "score": 1.0,
+            "meta": doc["metadata"]
+        }]
+    }
 
 def _normalize_ko_query(q: str) -> str:
     s = (q or "").strip()
@@ -128,6 +254,10 @@ def search_and_ingest(req: SearchAndIngestReq):
     q_norm = _normalize_ko_query(q)
     q_eff  = _boost_overview(q_norm)
 
+    exact = _try_exact_page_ingest(q, req.space)
+    if exact:
+        return exact
+    
     # 1) 1차 RAG 조회
     qres = rag_query(q_eff, k)
 
@@ -159,14 +289,16 @@ def search_and_ingest(req: SearchAndIngestReq):
             title = page.get("title") or it.get("title") or ""
             if not text:
                 continue
+            md = {
+                "source": "confluence",
+                "title": title,
+                "url": it.get("url") or "",
+            }
             new_docs.append({
                 "id": f"confluence:{pid}",
-                "text": text[:200_000],
-                "metadata": {
-                    "source": "confluence",
-                    "title": title,
-                    "url": it.get("url") or "",
-                }
+                "text": text[:MAX_DOC_CHARS],
+                "metadata": md,
+                "meta": md
             })
 
         if new_docs:
@@ -184,7 +316,7 @@ def search_and_ingest(req: SearchAndIngestReq):
             {
                 "chunk": (h.get("text") or "")[:1200],
                 "score": float(h.get("score") or 0.0),
-                "meta":  h.get("metadata") or {}
+                "meta":  (h.get("metadata") or h.get("meta") or {})
             } for h in (items or [])
         ]
     }
