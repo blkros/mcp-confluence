@@ -13,6 +13,8 @@ USER        = os.environ.get("CONFLUENCE_USER") or ""
 PASSWORD    = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL  = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT","20"))
+DEFAULT_SPACE   = os.getenv("CONFLUENCE_SPACE", "SMST")  # 기본 스코프
+DEFAULT_ANCESTOR = os.getenv("CONFLUENCE_ANCESTOR", "")  # 선택(루트 pageId)
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
@@ -29,6 +31,9 @@ CONTENT_API          = f"{BASE_URL}/rest/api/content"
 
 def page_view_url(page_id: str) -> str:
     return f"{BASE_URL}/pages/viewpage.action?pageId={page_id}"
+
+def _is_allowed_space(space_key: str) -> bool:
+    return (not DEFAULT_SPACE) or (space_key or "").upper() == DEFAULT_SPACE.upper()
 
 # ──────────────────────────────────────────────────────────────
 # FastMCP 앱
@@ -189,6 +194,11 @@ def _get_page_impl(page_id: str) -> dict:
 
         if r.status_code == 200 and "application/json" in ct:
             j = r.json() or {}
+            space_key = ((j.get("space") or {}).get("key")) or ""
+            if not _is_allowed_space(space_key):
+                c.close()
+                raise RuntimeError(f"Blocked by space guard (expected {DEFAULT_SPACE}, got {space_key})")
+            
             body_html = ((j.get("body") or {}).get("storage") or {}).get("value", "") or ""
             return {
                 "id": str(j.get("id") or pid),
@@ -238,6 +248,10 @@ def _get_page_impl(page_id: str) -> dict:
                 try: version = int(m.group(1))
                 except: version = 0
 
+        if not _is_allowed_space(space_key):
+            c2.close()
+            raise RuntimeError(f"Blocked by space guard (expected {DEFAULT_SPACE}, got {space_key or 'UNKNOWN'})")
+        
         if not (title or body_html):
             # HTML 폴백도 실패하면 명시적으로 에러
             raise RuntimeError(f"Page not accessible via REST/HTML: {pid}")
@@ -253,14 +267,6 @@ def _get_page_impl(page_id: str) -> dict:
     finally:
         c2.close()
 
-# def _browser_headers() -> dict:
-#     return {
-#         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-#         "User-Agent": "Mozilla/5.0",
-#         "Referer": f"{BASE_URL}/dashboard.action",
-#         "Accept-Language": "ko,en;q=0.9",
-#     }
-
 @mcp.tool()
 def get_page(page_id: str) -> dict:
     return _get_page_impl(page_id)
@@ -270,11 +276,16 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
     text = _to_cql_text(query or "")
     if not text:
         return []
+    
+    space = space or DEFAULT_SPACE
+    ancestor = (DEFAULT_ANCESTOR or "").strip()
 
     def _cql_attempts(text: str, space: t.Optional[str]) -> t.List[str]:
         base_parts = ['type=page']
         if space:
-            base_parts.append(f"space={space}")
+            base_parts.append(f'space="{space}"')
+        if ancestor.isdigit():
+            base_parts.append(f"ancestor={ancestor}")
         base = " AND ".join(base_parts)
         toks = [t for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", text) if t.lower() not in _STOP][:4]
         attempts = [f'{base} AND (title ~ "{text}" OR text ~ "{text}")']
@@ -410,6 +421,7 @@ def search(
     space: t.Optional[str] = None
 ) -> t.List[dict]:
     k = int(limit) if (isinstance(limit, int) and limit > 0) else int(top_k)
+    space = space or DEFAULT_SPACE
     items = _search_pages_impl(query=query, space=space, limit=k) or []
     out: t.List[dict] = []
 
@@ -449,8 +461,10 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
     text = _to_cql_text(query or "")
     if not text:
         return []
+    
+    space = space or DEFAULT_SPACE
+    params = {"queryString": text, "contentType": "page", "where": "conf_space", "spaceKey": space}
 
-    params = {"queryString": text, "contentType": "page"}
     if space:
         params["where"] = "conf_space"
         params["spaceKey"] = space
@@ -485,6 +499,12 @@ def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[st
     for pid in ids:
         title = ""
         excerpt = ""
+
+        rr = client.get(f"{CONTENT_API}/{quote_plus(pid)}", params={"expand": "space"})
+        if rr.status_code == 200 and "application/json" in (rr.headers.get("content-type","").lower()):
+            sp = ((rr.json() or {}).get("space") or {}).get("key") or ""
+            if not _is_allowed_space(sp):
+                continue 
 
         # 2) 해당 pageId를 가진 앵커의 innerText 시도(따옴표 양쪽 다 허용)
         am = re.search(
