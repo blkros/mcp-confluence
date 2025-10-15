@@ -528,7 +528,7 @@ from fastapi import FastAPI
 api = FastAPI()
 
 # FIX: 클라이언트 기본값(/sse)에 맞춤
-api.mount("/sse", mcp.sse_app())
+api.mount("/", mcp.sse_app())
 
 @api.get("/health")
 def health():
