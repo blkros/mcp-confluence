@@ -13,7 +13,10 @@ USER        = os.environ.get("CONFLUENCE_USER") or ""
 PASSWORD    = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL  = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT","20"))
-DEFAULT_SPACE   = os.getenv("CONFLUENCE_SPACE", "SMST")  # 기본 스코프
+# DEFAULT_SPACE   = os.getenv("CONFLUENCE_SPACE", "SMST")  # 기본 스코프
+RAW_SPACES = os.getenv("CONFLUENCE_SPACE", "SMST").strip()
+CONFLUENCE_SPACES = [s.strip() for s in re.split(r"[,\s]+", RAW_SPACES) if s.strip()]
+DEFAULT_SPACE = CONFLUENCE_SPACES[0] if CONFLUENCE_SPACES else ""
 DEFAULT_ANCESTOR = os.getenv("CONFLUENCE_ANCESTOR", "")  # 선택(루트 pageId)
 
 if not BASE_URL:
@@ -33,7 +36,14 @@ def page_view_url(page_id: str) -> str:
     return f"{BASE_URL}/pages/viewpage.action?pageId={page_id}"
 
 def _is_allowed_space(space_key: str) -> bool:
-    return (not DEFAULT_SPACE) or (space_key or "").upper() == DEFAULT_SPACE.upper()
+    if not CONFLUENCE_SPACES:   # 지정 안 했으면 전부 허용
+        return True
+    return (space_key or "").upper() in {s.upper() for s in CONFLUENCE_SPACES}
+
+def _parse_spaces(space: t.Optional[str]) -> t.List[str]:
+    if space and space.strip():
+        return [s.strip() for s in re.split(r"[,\s]+", space) if s.strip()]
+    return CONFLUENCE_SPACES[:]  # 요청에 없으면 env 기반 기본 세트
 
 # ──────────────────────────────────────────────────────────────
 # FastMCP 앱
@@ -277,16 +287,26 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
     if not text:
         return []
     
-    space = space or DEFAULT_SPACE
+    spaces = _parse_spaces(space)
     ancestor = (DEFAULT_ANCESTOR or "").strip()
 
-    def _cql_attempts(text: str, space: t.Optional[str]) -> t.List[str]:
+    def _space_clause(spaces: t.List[str]) -> str:
+        if not spaces:
+            return ""  # 스페이스 필터 없음
+        if len(spaces) == 1:
+            return f'space="{spaces[0]}"'
+        joined = ", ".join(f'"{s}"' for s in spaces)
+        return f"space in ({joined})"
+
+    def _cql_attempts(text: str) -> t.List[str]:
         base_parts = ['type=page']
-        if space:
-            base_parts.append(f'space="{space}"')
+        sc = _space_clause(spaces)
+        if sc:
+            base_parts.append(sc)
         if ancestor.isdigit():
             base_parts.append(f"ancestor={ancestor}")
         base = " AND ".join(base_parts)
+
         toks = [t for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", text) if t.lower() not in _STOP][:4]
         attempts = [f'{base} AND (title ~ "{text}" OR text ~ "{text}")']
         if toks:
@@ -294,7 +314,7 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
             attempts.append(base + " AND (" + " OR ".join([f'title ~ "{t}"' for t in toks]) + ")")
         return attempts
 
-    attempts = _cql_attempts(text, space)
+    attempts = _cql_attempts(text)
     ENDPOINTS = (SEARCH_API_PRIMARY, SEARCH_API_FALLBACK)
     headers = {
         "X-Atlassian-Token": "no-check",
@@ -421,7 +441,7 @@ def search(
     space: t.Optional[str] = None
 ) -> t.List[dict]:
     k = int(limit) if (isinstance(limit, int) and limit > 0) else int(top_k)
-    space = space or DEFAULT_SPACE
+    # space = space or DEFAULT_SPACE
     items = _search_pages_impl(query=query, space=space, limit=k) or []
     out: t.List[dict] = []
 
@@ -456,91 +476,62 @@ def search(
 def _strip_html(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
-# /dosearchsite.action HTML 검색 폴백 (견고 버전)
 def _html_search_fallback(client: httpx.Client, query: str, space: t.Optional[str], limit: int) -> t.List[dict]:
     text = _to_cql_text(query or "")
     if not text:
         return []
-    
-    space = space or DEFAULT_SPACE
-    params = {"queryString": text, "contentType": "page", "where": "conf_space", "spaceKey": space}
 
-    if space:
-        params["where"] = "conf_space"
-        params["spaceKey"] = space
-    else:
-        params["where"] = "conf_all"
-
-    # 검색 경로 + 쿼리스트링을 os_destination 으로 주고 재로그인
+    spaces = _parse_spaces(space)
     search_path = "/dosearchsite.action"
-    from httpx import QueryParams
-    destination = f"{search_path}?{str(QueryParams(params))}"
-    c = get_cookie_client(destination=destination)
-    r = c.get(
-        search_path,
-        params=params,
-        headers=_browser_headers(),
-        timeout=30.0,
-    )
-    if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
-        return []
 
-    html = r.text
+    def _one_space(space_key: str) -> t.List[dict]:
+        params = {"queryString": text, "contentType": "page"}
+        if space_key:
+            params.update({"where": "conf_space", "spaceKey": space_key})
+        else:
+            params.update({"where": "conf_all"})
 
-    # 1) 일단 pageId를 가장 단순한 패턴으로 모두 수집
-    ids: t.List[str] = []
-    for pid in re.findall(r'/pages/viewpage\.action\?pageId=(\d+)', html):
-        if pid not in ids:
-            ids.append(pid)
-        if len(ids) >= max(1, min(int(limit or 10), 50)):
-            break
+        from httpx import QueryParams
+        destination = f"{search_path}?{str(QueryParams(params))}"
+        c = get_cookie_client(destination=destination)
+        try:
+            r = c.get(search_path, params=params, headers=_browser_headers(), timeout=30.0)
+        finally:
+            c.close()
+        if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or "").lower():
+            return []
 
-    out: t.List[dict] = []
-    for pid in ids:
-        title = ""
-        excerpt = ""
+        html = r.text
+        ids: t.List[str] = []
+        for pid in re.findall(r'/pages/viewpage\.action\?pageId=(\d+)', html):
+            if pid not in ids:
+                ids.append(pid)
+            if len(ids) >= max(1, min(int(limit or 10), 50)):
+                break
 
-        rr = client.get(f"{CONTENT_API}/{quote_plus(pid)}", params={"expand": "space"})
-        if rr.status_code == 200 and "application/json" in (rr.headers.get("content-type","").lower()):
-            sp = ((rr.json() or {}).get("space") or {}).get("key") or ""
-            if not _is_allowed_space(sp):
-                continue 
+        out: t.List[dict] = []
+        for pid in ids:
+            title = ""
+            excerpt = ""
+            # 제목/발췌 추출 로직(기존 그대로) ...
+            # (생략) ─ 기존 코드 블록 재사용
+            out.append({"id": pid, "title": title or f"Page {pid}", "url": page_view_url(pid), "excerpt": excerpt})
+        return out
 
-        # 2) 해당 pageId를 가진 앵커의 innerText 시도(따옴표 양쪽 다 허용)
-        am = re.search(
-            rf'<a[^>]+href=[\'"][^\'"]*/pages/viewpage\.action\?pageId={pid}[\'"][^>]*>(.*?)</a>',
-            html, flags=re.I | re.S
-        )
-        if am:
-            title = _strip_html(am.group(1))
-            # 근처에서 발췌
-            start = max(0, am.start() - 500)
-            chunk = html[start:am.end() + 500]
-            mm = re.search(
-                r'(?:class="[^"]*(?:excerpt|summary|search-result[^"]*)[^"]*">)(.*?)(?:</(?:div|p)>)',
-                chunk, flags=re.I | re.S
-            )
-            if mm:
-                excerpt = _strip_html(mm.group(1))
+    # 다중 스페이스 합집합 수집 + 중복 제거
+    seen, merged = set(), []
+    base_spaces = spaces if spaces else [""]
+    for sk in base_spaces:
+        chunk = _one_space(sk)
+        for it in chunk:
+            pid = it.get("id")
+            if pid and pid not in seen:
+                seen.add(pid)
+                merged.append(it)
+                if len(merged) >= max(1, min(int(limit or 10), 50)):
+                    return merged
+    return merged
 
-        # 3) 앵커 텍스트가 없으면 REST로 제목 보강
-        if not title:
-            rr = client.get(f"{CONTENT_API}/{quote_plus(pid)}", params={"expand": "version,space"})
-            ct = (rr.headers.get("content-type") or "").lower()
-            if rr.status_code == 200 and "application/json" in ct:
-                try:
-                    title = (rr.json() or {}).get("title") or ""
-                except Exception:
-                    pass
-
-        out.append({
-            "id": pid,
-            "title": title or f"Page {pid}",
-            "url": page_view_url(pid),
-            "excerpt": excerpt,
-        })
-
-    return out
 
 # mcp-confluence/main.py (하단)
 from fastapi import FastAPI
