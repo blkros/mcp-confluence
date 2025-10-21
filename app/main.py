@@ -19,6 +19,14 @@ CONFLUENCE_SPACES = [s.strip() for s in re.split(r"[,\s]+", RAW_SPACES) if s.str
 DEFAULT_SPACE = CONFLUENCE_SPACES[0] if CONFLUENCE_SPACES else ""
 DEFAULT_ANCESTOR = os.getenv("CONFLUENCE_ANCESTOR", "")  # 선택(루트 pageId)
 
+# HTML 검색(사이트 검색) 폴백 끄기/켜기
+USE_HTML_FALLBACK = (
+    os.getenv("ENABLE_SITE_SEARCH","").lower() in ("1","true","yes")
+    or os.getenv("SITE_SEARCH_FALLBACK","").lower() in ("1","true","yes")
+    or os.getenv("USE_HTML_SEARCH","").lower() in ("1","true","yes")
+)
+
+
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
 
@@ -351,12 +359,15 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
     finally:
         client.close()
 
-    # HTML 폴백은 무조건 쿠키 세션 사용
-    c2 = get_cookie_client()
-    try:
-        return _html_search_fallback(c2, query, space, limit)
-    finally:
-        c2.close()
+    # REST 실패 시: HTML 폴백은 env가 true일 때만
+    if USE_HTML_FALLBACK:
+        c2 = get_cookie_client()
+        try:
+            return _html_search_fallback(c2, query, space, limit)
+        finally:
+            c2.close()
+    else:
+        return []
 
 @mcp.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:

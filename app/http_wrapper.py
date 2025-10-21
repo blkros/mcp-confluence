@@ -17,6 +17,15 @@ PASSWORD = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 DEFAULT_SPACE = os.getenv("CONF_DEFAULT_SPACE", "").strip() or None
 
+
+USE_HTML_FALLBACK = (
+    (os.environ.get("ENABLE_SITE_SEARCH") or "").lower() in ("1","true","yes") or
+    (os.environ.get("SITE_SEARCH_FALLBACK") or "").lower() in ("1","true","yes") or
+    (os.environ.get("USE_HTML_SEARCH") or "").lower() in ("1","true","yes")
+)
+
+
+
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
 
@@ -153,23 +162,27 @@ api = FastAPI(title="Confluence HTTP Wrapper", version="1.0.0")
 
 @api.post("/tool/search")
 def tool_search(payload: dict = Body(...)):
-    """
-    입력: { "query": "...", "limit": 5, "space": "ENG"(옵션) }
-    출력: { "items": [ {page_id, title, url, excerpt} ] }
-    """
     query = (payload or {}).get("query", "")
     limit = int((payload or {}).get("limit", 5) or 5)
     space = (payload or {}).get("space") or DEFAULT_SPACE
 
-    # 1) 쿼리 정제
     text = _to_cql_text(query)
     if not text:
         return {"items": []}
 
-    # 2) CQL 구성
-    parts = ['type=page', f'text ~ "{text}"']
+    # --- 멀티 스페이스 파싱 ---
+    spaces = []
     if space:
-        parts.append(f"space={space}")
+        spaces = [s.strip() for s in re.split(r"[,\s]+", str(space)) if s.strip()]
+
+    # --- CQL 구성 ---
+    parts = ['type=page', f'text ~ "{text}"']
+    if spaces:
+        if len(spaces) == 1:
+            parts.append(f'space="{spaces[0]}"')
+        else:
+            joined = ", ".join(f'"{s}"' for s in spaces)
+            parts.append(f"space in ({joined})")
     cql = " AND ".join(parts)
 
     params = {
@@ -178,18 +191,32 @@ def tool_search(payload: dict = Body(...)):
         "expand": "space",
     }
 
-    # 3) Basic 먼저 시도
     s = get_session_for_rest()
     r = s.get(SEARCH_API, params=params, timeout=30)
 
-    # 4) 401/403이면 쿠키 로그인 폴백
     if r.status_code in (401, 403):
         s = ensure_cookie_session()
         r = s.get(SEARCH_API, params=params, timeout=30)
 
-    # 5) 여전히 실패/차단되면 HTML 검색 폴백
+    # JSON 실패/차단 시 폴백은 env가 true일 때만
     if r.status_code in (401, 403, 302) or "application/json" not in (r.headers.get("content-type","").lower()):
-        return _html_search_fallback(s, text, space, limit)
+        if not USE_HTML_FALLBACK:
+            return {"items": []}
+        # HTML 폴백(멀티 스페이스 지원)
+        items_all = []
+        targets = spaces or [None]  # space 미지정이면 conf_all(권장X)이지만 기존 동작 유지
+        for sp in targets:
+            x = _html_search_fallback(s, text, sp, limit).get("items", [])
+            items_all.extend(x)
+            if len(items_all) >= limit:
+                break
+        # 중복 제거
+        uniq, seen = [], set()
+        for it in items_all:
+            pid = it.get("page_id")
+            if pid and pid not in seen:
+                seen.add(pid); uniq.append(it)
+        return {"items": uniq[:limit]}
 
     if r.status_code == 400:
         return {"items": []}
@@ -214,6 +241,7 @@ def tool_search(payload: dict = Body(...)):
             "excerpt": excerpt
         })
     return {"items": items}
+
 
 @api.get("/tool/page_text/{page_id}")
 def tool_page_text(page_id: str):
@@ -262,7 +290,7 @@ def tool_page_text(page_id: str):
     if r.status_code == 404:
         raise HTTPException(404, "Confluence page not found")
     r.raise_for_status()
-    
+
     js   = r.json() or {}
     title = js.get("title") or ""
     html  = ((js.get("body") or {}).get("storage") or {}).get("value", "")
