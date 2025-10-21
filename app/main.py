@@ -581,3 +581,27 @@ if __name__ == "__main__":
     import os, uvicorn
     port = int(os.getenv("FASTMCP_PORT", "9000"))
     uvicorn.run(api, host="0.0.0.0", port=port)
+
+# --- Debug/HTTP mirror of MCP tools (for curl testing) ---
+from fastapi import Body
+
+@api.post("/tool/search")
+def http_tool_search(payload: dict = Body(...)):
+    query = (payload or {}).get("query", "")
+    limit = int((payload or {}).get("limit", 5) or 5)
+    space = (payload or {}).get("space")
+    # 내부 MCP 도구 로직 재사용
+    items = search(query=query, top_k=limit, limit=limit, space=space)  # returns list[dict]
+    return {"items": items}
+
+@api.get("/tool/page_text/{page_id}")
+def http_tool_page_text(page_id: str):
+    info = _get_page_impl(page_id)  # { id, title, space, version, body_html, url }
+    text = _html_to_text(info.get("body_html", ""))
+    return {
+        "page_id": info.get("id"),
+        "title": info.get("title"),
+        "space": info.get("space"),
+        "url": info.get("url"),
+        "text": text,
+    }
