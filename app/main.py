@@ -575,7 +575,7 @@ def health():
     return {"status": "ok", "base_url": BASE_URL}
 
 # FIX: 클라이언트 기본값(/sse)에 맞춤
-api.mount("/sse", mcp.sse_app())
+api.mount("/", mcp.sse_app())
 
 if __name__ == "__main__":
     import os, uvicorn
