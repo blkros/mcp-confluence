@@ -49,9 +49,21 @@ def _is_allowed_space(space_key: str) -> bool:
     return (space_key or "").upper() in {s.upper() for s in CONFLUENCE_SPACES}
 
 def _parse_spaces(space: t.Optional[str]) -> t.List[str]:
+    """
+    요청에서 space가 와도, 환경변수 CONFLUENCE_SPACE와 합집합으로 취급한다.
+    (rag-proxy가 NTRP만 넘겨도 SMST,NTRP 둘 다 검색되게)
+    """
+    base = CONFLUENCE_SPACES[:]  # env 허용 스페이스들, 예: ["SMST","NTRP"]
+    req = []
     if space and space.strip():
-        return [s.strip() for s in re.split(r"[,\s]+", space) if s.strip()]
-    return CONFLUENCE_SPACES[:]  # 요청에 없으면 env 기반 기본 세트
+        req = [s.strip() for s in re.split(r"[,\s]+", space) if s.strip()]
+
+    out = []
+    for x in (req + base):
+        if x and x not in out:
+            out.append(x)
+    return out
+
 
 # ──────────────────────────────────────────────────────────────
 # FastMCP 앱
