@@ -14,7 +14,7 @@ PASSWORD    = os.environ.get("CONFLUENCE_PASSWORD") or ""
 VERIFY_SSL  = (os.environ.get("VERIFY_SSL") or "true").lower() not in ("false", "0", "no")
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT","20"))
 # DEFAULT_SPACE   = os.getenv("CONFLUENCE_SPACE", "SMST")  # 기본 스코프
-RAW_SPACES = os.getenv("CONFLUENCE_SPACE", "SMST").strip()
+RAW_SPACES = os.getenv("CONFLUENCE_SPACE", "").strip()
 CONFLUENCE_SPACES = [s.strip() for s in re.split(r"[,\s]+", RAW_SPACES) if s.strip()]
 DEFAULT_SPACE = CONFLUENCE_SPACES[0] if CONFLUENCE_SPACES else ""
 DEFAULT_ANCESTOR = os.getenv("CONFLUENCE_ANCESTOR", "")  # 선택(루트 pageId)
@@ -83,10 +83,11 @@ def _to_cql_text(q: str) -> str:
     return q[:CQL_MAX]
 
 async def search_rest(query: str, limit: int = 5):
+    text = _to_cql_text(query)
     auth = (USER, PASSWORD) if USER and PASSWORD else None
     async with httpx.AsyncClient(base_url=BASE_URL, follow_redirects=True, timeout=TIMEOUT, verify=VERIFY_SSL) as client:
         r = await client.get("/rest/api/search",
-                             params={"cql": f'text~"{query}"', "expand":"content.body.storage","limit":limit},
+                             params={"cql": f'text~"{text}"', "expand":"content.body.storage","limit":limit},
                              auth=auth,
                              headers={"Accept":"application/json","X-Requested-With":"XMLHttpRequest"})
         if r.status_code != 200:
@@ -383,7 +384,11 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
 
 @mcp.tool()
 def search_pages(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
-    items = _search_pages_impl(query, space, limit) or []
+    try:
+        items = _search_pages_impl(query, space, limit) or []
+    except Exception as e:
+        print(f"[mcp] search_pages error: {e}", flush=True)
+        return []
     # excerpt 비면 간단 보강
     if items:
         c = get_cookie_client()
@@ -463,11 +468,15 @@ def search(
     limit: t.Optional[int] = None,
     space: t.Optional[str] = None
 ) -> t.List[dict]:
-    k = int(limit) if (isinstance(limit, int) and limit > 0) else int(top_k)
-    # space = space or DEFAULT_SPACE
-    items = _search_pages_impl(query=query, space=space, limit=k) or []
-    out: t.List[dict] = []
-
+    try:
+        k = int(limit) if (isinstance(limit, int) and limit > 0) else int(top_k)
+        # space = space or DEFAULT_SPACE
+        items = _search_pages_impl(query=query, space=space, limit=k) or []
+        out: t.List[dict] = []
+    except Exception as e:
+        print(f"[mcp] search error: {e}", flush=True)
+        return []
+    
     for it in items:
         pid = it.get("id")
         title = it.get("title") or ""
@@ -566,7 +575,7 @@ def health():
     return {"status": "ok", "base_url": BASE_URL}
 
 # FIX: 클라이언트 기본값(/sse)에 맞춤
-api.mount("/", mcp.sse_app())
+api.mount("/sse", mcp.sse_app())
 
 if __name__ == "__main__":
     import os, uvicorn
