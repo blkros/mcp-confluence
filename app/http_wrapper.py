@@ -24,6 +24,31 @@ USE_HTML_FALLBACK = (
     (os.environ.get("USE_HTML_SEARCH") or "").lower() in ("1","true","yes")
 )
 
+_KO_STOP = {
+    "에서","에","에게","으로","로","을","를","이","가","은","는","와","과",
+    "대한","대해서","관해","관련","소개","설명","정리","알려줘","해줘","해주세요",
+    "컨플루언스에서","컨플루언스"
+}
+_KO_POSTFIX = re.compile(r"(에서|으로|로|에게|에|은|는|이|가|을|를)$")
+
+def _norm_ko_tokens(s: str) -> t.List[str]:
+    toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s or "")
+    out = []
+    for t in toks:
+        tl = t.lower()
+        if tl in _STOP or tl in _KO_STOP:
+            continue
+        out.append(_KO_POSTFIX.sub("", t))
+    return [t for t in out if t]
+
+def _guess_title(q: str) -> t.Optional[str]:
+    q = q.replace("프로젝트에", "프로젝트")
+    m = re.search(r'([A-Za-z0-9가-힣]+)\s*프로젝트', q)
+    if m:
+        return f'{m.group(1)} 프로젝트'
+    if "NIA" in q and "프로젝트" in q:
+        return "NIA 프로젝트"
+    return None
 
 
 if not BASE_URL:
@@ -176,7 +201,7 @@ def tool_search(payload: dict = Body(...)):
         spaces = [s.strip() for s in re.split(r"[,\s]+", str(space)) if s.strip()]
 
     # --- CQL 구성 ---
-    parts = ['type=page', f'text ~ "{text}"']
+    parts = ['type=page', f'(title ~ "{text}" OR text ~ "{text}")']
     if spaces:
         if len(spaces) == 1:
             parts.append(f'space="{spaces[0]}"')
@@ -240,6 +265,61 @@ def tool_search(payload: dict = Body(...)):
             "url": page_view_url(pid),
             "excerpt": excerpt
         })
+    # --- 0건이면 보강 재시도 ---
+    if not items:
+        # 공통 base
+        if spaces:
+            if len(spaces) == 1:
+                base_space = f'space="{spaces[0]}"'
+            else:
+                joined = ", ".join(f'"{s}"' for s in spaces)
+                base_space = f"space in ({joined})"
+        else:
+            base_space = ""
+
+        base = "type=page" + (f" AND {base_space}" if base_space else "")
+        toks = _norm_ko_tokens(text)[:4]
+        guess = _guess_title(text)
+
+        attempts = []
+        if guess:
+            attempts.append(f'{base} AND title ~ "{guess}"')
+        if toks:
+            # must 1~2개 (영문/숫자 또는 도메인 키워드 우선)
+            must = []
+            for tkn in toks:
+                if tkn.isascii() or tkn in {"프로젝트","계획","개요","요구사항","보고서"}:
+                    must.append(tkn)
+                if len(must) >= 2:
+                    break
+            if not must:
+                must = toks[:1]
+            attempts.append(base + " AND " + " AND ".join([f'text ~ "{t}"' for t in must]))
+            attempts.append(base + " AND (" + " OR ".join([f'title ~ "{t}"' for t in toks]) + ")")
+
+        for cql2 in attempts:
+            r2 = s.get(SEARCH_API,
+                       params={"cql": cql2, "limit": max(1, min(limit, 50)), "expand": "space"},
+                       timeout=30)
+            if r2.status_code in (401, 403):
+                s = ensure_cookie_session()
+                r2 = s.get(SEARCH_API,
+                           params={"cql": cql2, "limit": max(1, min(limit, 50)), "expand": "space"},
+                           timeout=30)
+            if r2.status_code == 200 and "application/json" in (r2.headers.get("content-type","").lower()):
+                js2 = r2.json() or {}
+                for rr in (js2.get("results") or []):
+                    content = (rr.get("content") or {})
+                    if content.get("type") != "page":
+                        continue
+                    pid = str(content.get("id") or "")
+                    if not pid:
+                        continue
+                    title = content.get("title") or f"Page {pid}"
+                    excerpt = _html_to_text(rr.get("excerpt") or "")[:300]
+                    items.append({"page_id": pid, "title": title, "url": page_view_url(pid), "excerpt": excerpt})
+                if items:
+                    break
     return {"items": items}
 
 
@@ -290,9 +370,8 @@ def tool_page_text(page_id: str):
     if r.status_code == 404:
         raise HTTPException(404, "Confluence page not found")
     r.raise_for_status()
-
-    js   = r.json() or {}
-    title = js.get("title") or ""
+    js = r.json() or {}
+    title = js.get("title") or f"Page {page_id}"
     html  = ((js.get("body") or {}).get("storage") or {}).get("value", "")
     text  = _html_to_text(html)
     return {"page_id": page_id, "title": title, "text": text[:200_000]}

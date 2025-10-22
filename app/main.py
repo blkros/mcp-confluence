@@ -26,6 +26,36 @@ USE_HTML_FALLBACK = (
     or os.getenv("USE_HTML_SEARCH","").lower() in ("1","true","yes")
 )
 
+# --- add: Korean stopwords & normalizer --------------------------------
+_KO_STOP = {
+    "에서","에","에게","으로","로","을","를","이","가","은","는","와","과",
+    "대한","대해서","관해","관련","소개","설명","정리","알려줘","해줘","해주세요",
+    "컨플루언스에서","컨플루언스"
+}
+_KO_POSTFIX = re.compile(r"(에서|으로|로|에게|에|은|는|이|가|을|를)$")
+
+def _norm_ko_tokens(s: str) -> t.List[str]:
+    toks = re.findall(r"[A-Za-z0-9가-힣]{2,}", s or "")
+    out = []
+    for t in toks:
+        tl = t.lower()
+        if tl in _STOP or tl in _KO_STOP:
+            continue
+        # 조사 꼬리 제거: 프로젝트에 -> 프로젝트
+        t2 = _KO_POSTFIX.sub("", t)
+        if t2:
+            out.append(t2)
+    return out
+
+def _guess_title(q: str) -> t.Optional[str]:
+    q = q.replace("프로젝트에", "프로젝트")
+    m = re.search(r'([A-Za-z0-9가-힣]+)\s*프로젝트', q)
+    if m:
+        return f'{m.group(1)} 프로젝트'
+    if "NIA" in q and "프로젝트" in q:
+        return "NIA 프로젝트"
+    return None
+
 
 if not BASE_URL:
     raise RuntimeError("CONFLUENCE_BASE_URL is not set")
@@ -304,6 +334,9 @@ def get_page(page_id: str) -> dict:
 
 # --- search_pages: impl + tool wrapper -----------------------
 def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 10) -> t.List[dict]:
+    needs_cookie = False
+    had_json_attempt = False  # JSON 응답을 한 번이라도 받았는지 플래그
+    
     text = _to_cql_text(query or "")
     if not text:
         return []
@@ -328,11 +361,32 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
             base_parts.append(f"ancestor={ancestor}")
         base = " AND ".join(base_parts)
 
-        toks = [t for t in re.findall(r"[A-Za-z0-9가-힣]{2,}", text) if t.lower() not in _STOP][:4]
-        attempts = [f'{base} AND (title ~ "{text}" OR text ~ "{text}")']
+        # 기존 1차: 문장 전체(현행 유지)
+        attempts: t.List[str] = [f'{base} AND (title ~ "{text}" OR text ~ "{text}")']
+
+        # 2차: 제목 추정 직격
+        g = _guess_title(text)
+        if g:
+            attempts.append(f'{base} AND title ~ "{g}"')
+
+        # 3차: 핵심 토큰 기반(한국어 조사 제거)
+        toks = _norm_ko_tokens(text)[:4]
         if toks:
-            attempts.append(base + " AND " + " AND ".join([f'text ~ "{t}"' for t in toks]))
+            # must(AND): 영문/숫자 또는 도메인 키워드 우선 1~2개
+            must: t.List[str] = []
+            for tkn in toks:
+                if tkn.isascii() or tkn in {"프로젝트","계획","개요","요구사항","보고서"}:
+                    must.append(tkn)
+                if len(must) >= 2:
+                    break
+            if not must:
+                must = toks[:1]
+
+            # 3-1) must AND
+            attempts.append(base + " AND " + " AND ".join([f'text ~ "{t}"' for t in must]))
+            # 3-2) 제목 OR 토큰
             attempts.append(base + " AND (" + " OR ".join([f'title ~ "{t}"' for t in toks]) + ")")
+
         return attempts
 
     attempts = _cql_attempts(text)
@@ -356,6 +410,7 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
                 if (r.status_code in (400, 403, 404, 501)) or ("application/json" not in ct):
                     continue
                 data = r.json() or {}
+                had_json_attempt = True
                 results = data.get("results") or []
                 out = []
                 for it in results:
@@ -367,6 +422,30 @@ def _search_pages_impl(query: str, space: t.Optional[str] = None, limit: int = 1
                         out.append({"id": page_id, "title": title, "url": page_view_url(page_id), "excerpt": excerpt})
                 if out:
                     return out
+                
+        # REST가 전부 0건이면(그리고 JSON을 한 번이라도 받았으면) limit 상향 재시도
+        if had_json_attempt and 1 <= int(limit or 10) < 12:
+            new_limit = 15  # 12~20 선호
+            for cql in attempts:
+                for endpoint in ENDPOINTS:
+                    r = client.get(endpoint, params={"cql": cql, "limit": new_limit, "expand": "space"},
+                                headers=headers, timeout=30.0)
+                    ct = (r.headers.get("content-type") or "").lower()
+                    if r.status_code in (400,403,404,501) or "application/json" not in ct:
+                        continue
+                    data = r.json() or {}
+                    results = data.get("results") or []
+                    out2 = []
+                    for it in results:
+                        content = (it or {}).get("content") or {}
+                        page_id = str(content.get("id") or it.get("id") or "")
+                        title = (content.get("title") or it.get("title") or "").strip()
+                        excerpt = (it.get("excerpt") or "").strip()
+                        if page_id and title:
+                            out2.append({"id": page_id, "title": title, "url": page_view_url(page_id), "excerpt": excerpt})
+                    if out2:
+                        return out2
+
         # REST가 안 먹었음 → HTML 폴백 필요
         needs_cookie = (client.auth is not None)  # Basic이었으면 쿠키 필요
     finally:
